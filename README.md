@@ -34,7 +34,8 @@ Start → Enter, Back → Esc, LB → F1, RB → P.
 Click the window icon or press Alt+Space:
 
 - **Full screen**
-- **Display ▸** Keep 4:3 aspect · Integer scaling · Smooth scaling
+- **Display ▸** Keep 4:3 aspect · Integer scaling · Smooth scaling · CRT scanlines (the same filter as
+  Civ64: DOSBox Pure Unleashed-style scanlines, two per game line, alike in a window and full screen)
 - **Mute sound**
 - **Pause when inactive** (on by default: the game stops and goes silent while another window
   has the focus)

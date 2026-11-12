@@ -28,6 +28,7 @@
 #include <wchar.h>
 #include "../../hal/hal.h"
 #include "audio_win32.h"
+#include "../crt.h"
 
 #define APP_NAMEW L"Prehistorik 2"
 #define APP_VERSIONW L"1.0"
@@ -40,6 +41,7 @@ static int g_running;               /* the emulation is up */
 static char g_game_dir[MAX_PATH * 3];
 static uint32_t g_frame[640 * 480];
 static int g_fw = 320, g_fh = 200;
+static int g_opt_crt = 0;   /* Display > CRT scanlines (crt.h) */
 static int g_opt_aspect = 1, g_opt_integer = 0, g_opt_smooth = 0, g_opt_full = 0, g_opt_mute = 0, g_opt_pause_inactive = 1;
 static int g_inactive;               /* the window is not the foreground window */
 static WINDOWPLACEMENT g_wp = {sizeof(WINDOWPLACEMENT)};
@@ -77,6 +79,7 @@ static void save_options(void)
     ini_set_int(L"Aspect", g_opt_aspect);
     ini_set_int(L"Integer", g_opt_integer);
     ini_set_int(L"Smooth", g_opt_smooth);
+    ini_set_int(L"Crt", g_opt_crt);
     ini_set_int(L"FullScreen", g_opt_full);
     ini_set_int(L"Mute", g_opt_mute);
     ini_set_int(L"PauseInactive", g_opt_pause_inactive);
@@ -466,6 +469,52 @@ static void dest_rect(int cw, int ch, RECT *r)
     r->bottom = r->top + (LONG)(dh + 0.5);
 }
 
+/* CRT scanlines: the scaled picture is made in a DIB section, filtered row by row (crt.h), then copied */
+static HDC g_crt_dc;
+static HBITMAP g_crt_bmp, g_crt_old;
+static uint32_t *g_crt_bits;
+static int g_crt_w, g_crt_h, g_crt_lines, g_crt_ph;
+static uint8_t g_crt_lvl[8192];
+
+/* the picture's height full screen on the window's monitor: the scanlines are spaced as there */
+static int crt_period_rows(int dh)
+{
+    MONITORINFO mi;
+    RECT f;
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return dh;
+    dest_rect(mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, &f);
+    return f.bottom - f.top > 0 ? f.bottom - f.top : dh;
+}
+
+static int crt_surface(HDC dc, int w, int h)
+{
+    BITMAPINFO bi;
+    void *bits = NULL;
+    if (g_crt_bmp != NULL && g_crt_w == w && g_crt_h == h) return 1;
+    if (g_crt_bmp != NULL) {
+        (void)SelectObject(g_crt_dc, g_crt_old);
+        (void)DeleteObject(g_crt_bmp);
+        g_crt_bmp = NULL;
+    }
+    if (g_crt_dc == NULL && (g_crt_dc = CreateCompatibleDC(dc)) == NULL) return 0;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_crt_bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (g_crt_bmp == NULL) return 0;
+    g_crt_old = (HBITMAP)SelectObject(g_crt_dc, g_crt_bmp);
+    g_crt_bits = (uint32_t *)bits;
+    g_crt_w = w;
+    g_crt_h = h;
+    g_crt_lines = 0;
+    return 1;
+}
+
 static void paint(HDC dc)
 {
     RECT cr, d;
@@ -485,6 +534,44 @@ static void paint(HDC dc)
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
+    if (g_opt_crt && d.bottom - d.top <= (LONG)sizeof g_crt_lvl && d.right - d.left <= 8192 && crt_surface(dc, d.right - d.left, d.bottom - d.top)) {
+        int w = d.right - d.left, h = d.bottom - d.top, y, lines = 2 * g_fh, ph = crt_period_rows(h);
+        if (g_crt_lines != lines || g_crt_ph != ph) {
+            crt_levels(g_crt_lvl, h, lines, ph);
+            g_crt_lines = lines;
+            g_crt_ph = ph;
+        }
+        (void)GdiFlush();
+        if (g_opt_smooth) {                            /* GDI's smoothing, then every pixel through the filter */
+            (void)SetStretchBltMode(g_crt_dc, HALFTONE);
+            (void)SetBrushOrgEx(g_crt_dc, 0, 0, NULL);
+            (void)StretchDIBits(g_crt_dc, 0, 0, w, h, 0, 0, g_fw, g_fh, g_frame, &bi, DIB_RGB_COLORS, SRCCOPY);
+            (void)GdiFlush();
+            for (y = 0; y < h; y++) crt_row(g_crt_bits + (size_t)y * (size_t)w, w, g_crt_lvl[y]);
+        } else {
+            /* sharp scaling: a source row is filtered once per weight (fw pixels) and widened by nearest
+             * neighbour; a row equal to the one above (same source row and weight) is a copy */
+            static uint32_t tmp[640];
+            static int xmap[8192];
+            int x, prev_sy = -1, prev_l = -1;
+            for (x = 0; x < w; x++) xmap[x] = (int)(((int64_t)x * g_fw) / w);
+            for (y = 0; y < h; y++) {
+                int sy = (int)(((int64_t)y * g_fh) / h), l = g_crt_lvl[y];
+                uint32_t *row = g_crt_bits + (size_t)y * (size_t)w;
+                if (sy == prev_sy && l == prev_l) {
+                    memcpy(row, row - w, (size_t)w * 4u);
+                    continue;
+                }
+                memcpy(tmp, g_frame + (size_t)sy * (size_t)g_fw, (size_t)g_fw * 4u);
+                crt_row(tmp, g_fw, l);
+                for (x = 0; x < w; x++) row[x] = tmp[xmap[x]];
+                prev_sy = sy;
+                prev_l = l;
+            }
+        }
+        (void)BitBlt(dc, d.left, d.top, w, h, g_crt_dc, 0, 0, SRCCOPY);
+        return;
+    }
     (void)SetStretchBltMode(dc, g_opt_smooth ? HALFTONE : COLORONCOLOR);
     if (g_opt_smooth) (void)SetBrushOrgEx(dc, 0, 0, NULL);
     (void)StretchDIBits(dc, d.left, d.top, d.right - d.left, d.bottom - d.top, 0, 0, g_fw, g_fh, g_frame, &bi,
@@ -572,6 +659,7 @@ static void set_full(int on)
 #define SC_P2_RESTART 0x1070u
 #define SC_P2_ABOUT 0x1080u
 #define SC_P2_PAUSE 0x1090u
+#define SC_P2_CRT 0x10A0u
 
 static void update_menu(void)
 {
@@ -581,6 +669,7 @@ static void update_menu(void)
     (void)CheckMenuItem(m, SC_P2_ASPECT, MF_BYCOMMAND | (g_opt_aspect ? MF_CHECKED : MF_UNCHECKED));
     (void)CheckMenuItem(m, SC_P2_INTEGER, MF_BYCOMMAND | (g_opt_integer ? MF_CHECKED : MF_UNCHECKED));
     (void)CheckMenuItem(m, SC_P2_SMOOTH, MF_BYCOMMAND | (g_opt_smooth ? MF_CHECKED : MF_UNCHECKED));
+    (void)CheckMenuItem(m, SC_P2_CRT, MF_BYCOMMAND | (g_opt_crt ? MF_CHECKED : MF_UNCHECKED));
     (void)CheckMenuItem(m, SC_P2_MUTE, MF_BYCOMMAND | (g_opt_mute ? MF_CHECKED : MF_UNCHECKED));
     (void)CheckMenuItem(m, SC_P2_PAUSE, MF_BYCOMMAND | (g_opt_pause_inactive ? MF_CHECKED : MF_UNCHECKED));
 }
@@ -601,6 +690,8 @@ static void add_menu(void)
     (void)AppendMenuW(disp, MF_STRING, SC_P2_ASPECT, L"&4:3 aspect ratio");
     (void)AppendMenuW(disp, MF_STRING, SC_P2_INTEGER, L"&Integer scaling");
     (void)AppendMenuW(disp, MF_STRING, SC_P2_SMOOTH, L"&Smooth scaling");
+    (void)AppendMenuW(disp, MF_SEPARATOR, 0u, NULL);
+    (void)AppendMenuW(disp, MF_STRING, SC_P2_CRT, L"&CRT scanlines");
     (void)AppendMenuW(m, MF_POPUP, (UINT_PTR)disp, L"&Display");
     (void)AppendMenuW(m, MF_STRING, SC_P2_MUTE, L"&Mute sound");
     (void)AppendMenuW(m, MF_STRING, SC_P2_PAUSE, L"&Pause when inactive");
@@ -714,6 +805,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
         case SC_P2_ASPECT: g_opt_aspect = !g_opt_aspect; save_options(); update_menu(); (void)InvalidateRect(h, NULL, FALSE); return 0;
         case SC_P2_INTEGER: g_opt_integer = !g_opt_integer; save_options(); update_menu(); (void)InvalidateRect(h, NULL, FALSE); return 0;
         case SC_P2_SMOOTH: g_opt_smooth = !g_opt_smooth; save_options(); update_menu(); (void)InvalidateRect(h, NULL, FALSE); return 0;
+        case SC_P2_CRT: g_opt_crt = !g_opt_crt; save_options(); update_menu(); (void)InvalidateRect(h, NULL, FALSE); return 0;
         case SC_P2_MUTE: g_opt_mute = !g_opt_mute; audio_set_muted(g_opt_mute || (g_inactive && g_opt_pause_inactive)); save_options(); update_menu(); return 0;
         case SC_P2_ABOUT: show_about(); return 0;
         case SC_P2_PAUSE: g_opt_pause_inactive = !g_opt_pause_inactive; save_options(); update_menu(); return 0;
@@ -866,6 +958,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_opt_aspect = ini_int(L"Aspect", 1);
     g_opt_integer = ini_int(L"Integer", 0);
     g_opt_smooth = ini_int(L"Smooth", 0);
+    g_opt_crt = ini_int(L"Crt", 0);
     g_opt_mute = ini_int(L"Mute", 0);
     g_opt_pause_inactive = ini_int(L"PauseInactive", 1);
     if (!load_embedded_pack() && !find_game_dir(argc > 1 ? argv[1] : NULL)) return 1;
