@@ -45,6 +45,7 @@ uint8_t vga_in(uint16_t port);
 void vga_out(uint16_t port, uint8_t v);
 void vga_set_mode(int mode);
 void vga_render(HostFrame *f);
+void vga_debug_dump(const char *path);   /* the four planes, raw */
 void vga_vsync_latch(void);
 extern int g_vga_retrace;             /* 1 during vertical retrace */
 extern int g_vga_hblank;

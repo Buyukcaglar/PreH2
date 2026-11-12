@@ -96,6 +96,7 @@ marks an extended key).
 | `P2_HASH=file` | per-frame picture hashes (p2test) |
 | `P2_WAV=file` | record the sound (p2test) |
 | `P2_EVERY=n` | PNG every n frames (p2test) |
+| `P2_VRAM=file` | dump the four video planes at the end of the run (p2test) |
 | `P2_COV=file` | executed-offset coverage (p2test; `tools/coverage.ps1`) |
 | `P2_DOSLOG`, `P2_PORTLOG`, `P2_SBLOG` | DOS call / port / Sound Blaster traces |
 | `P2_AUDIOLOG=file` | audio underrun and drop statistics (PreH2.exe) |

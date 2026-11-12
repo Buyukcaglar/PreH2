@@ -87,6 +87,7 @@ int main(int argc, char **argv)
         if (!hal_frame()) { fprintf(stderr, "program ended at frame %ld: %s\n", i, g_hal_exit_msg); break; }
     }
     wav_close();
+    if (getenv("P2_VRAM")) vga_debug_dump(getenv("P2_VRAM"));
     if (g_cov) {
         FILE *cf = fopen(getenv("P2_COV"), "ab");
         if (cf) { long k; for (k = 0; k < 65536; k++) if (g_cov[k]) fprintf(cf, "%04lx\n", k); fclose(cf); }

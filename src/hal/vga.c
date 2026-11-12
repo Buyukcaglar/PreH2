@@ -4,6 +4,7 @@
  * (640x480x16) and 13h (320x200x256); the picture is built from the registers, not from the mode
  * number, so the program's own register changes take effect. */
 #include "hal.h"
+#include <stdio.h>
 #include <string.h>
 
 static uint8_t planes[4][65536];
@@ -263,6 +264,7 @@ void vga_render(HostFrame *f)
 {
     uint32_t pal[256];
     int i, w, h, lpr, shift, offset, mode256, row, split_row, lc, vde, pan;
+    uint32_t amask;
     for (i = 0; i < 256; i++) {
         int j = i & dac_mask;
         uint32_t r = dac[j][0], g = dac[j][1], b = dac[j][2];
@@ -288,6 +290,13 @@ void vga_render(HostFrame *f)
     lc = crtc[0x18] | ((crtc[7] & 0x10) << 4) | ((crtc[9] & 0x40) << 3);
     split_row = (lc + 1 + lpr - 1) / lpr;
     pan = attr[0x13] & 7;
+    /* CRTC mode control bits 0 and 1 clear: memory address bits 13 and 14 come from the row scan
+     * counter (CGA/Hercules banking).  The rows here are whole character rows, whose first scan
+     * line has row scan 0, so those address bits are 0 and the picture wraps within 8 or 16 KB.
+     * The difficulty screen's diagonal scroll relies on the 8 KB wrap. */
+    amask = 0xFFFFu;
+    if (!(crtc[0x17] & 1u)) amask &= ~0x2000u;
+    if (!(crtc[0x17] & 2u)) amask &= ~0x4000u;
     for (row = 0; row < h; row++) {
         uint32_t *out = fb + (size_t)row * (size_t)w;
         uint32_t counter;
@@ -300,14 +309,14 @@ void vga_render(HostFrame *f)
             int skip = rpan >> 1;
             for (x = 0; x < w; x++) {
                 int px = x + skip;
-                uint32_t addr = ((counter + (uint32_t)(px >> 2)) << shift) & 0xFFFFu;
+                uint32_t addr = ((counter + (uint32_t)(px >> 2)) << shift) & amask;
                 out[x] = pal[planes[px & 3][addr]];
             }
         } else {
             uint8_t cpe = attr[0x12] & 0x0Fu;
             for (x = 0; x < w; x++) {
                 int px = x + rpan;
-                uint32_t addr = ((counter + (uint32_t)(px >> 3)) << shift) & 0xFFFFu;
+                uint32_t addr = ((counter + (uint32_t)(px >> 3)) << shift) & amask;
                 int bit = 7 - (px & 7);
                 int c = ((planes[0][addr] >> bit) & 1) | (((planes[1][addr] >> bit) & 1) << 1) |
                         (((planes[2][addr] >> bit) & 1) << 2) | (((planes[3][addr] >> bit) & 1) << 3);
@@ -323,4 +332,13 @@ void vga_render(HostFrame *f)
     }
     f->width = w;
     f->height = h;
+}
+
+/* diagnostics (p2test, P2_VRAM): the four planes, raw, into a file */
+void vga_debug_dump(const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) return;
+    (void)fwrite(planes, 1, sizeof planes, f);
+    fclose(f);
 }
