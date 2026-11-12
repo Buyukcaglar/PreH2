@@ -1,5 +1,6 @@
 /* dos.c - the DOS and BIOS services the program calls (int 10h, 12h, 16h, 1Ah, 21h, 2Fh, 67h).
- * Files are read from the game folder (host_game_dir), names matched without regard to case. */
+ * Files are read from the embedded pack when there is one (pack.c), otherwise from the game
+ * folder (host_game_dir); names are matched without regard to case. */
 #include "hal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,38 @@
 #endif
 
 #define MAX_FILES 16
-static FILE *g_files[MAX_FILES];
+typedef struct DFile {        /* an open file: on disk (f) or in the pack (mem) */
+    FILE *f;
+    const uint8_t *mem;
+    size_t len, pos;
+} DFile;
+static DFile *g_files[MAX_FILES];
+static DFile g_slots[MAX_FILES];
+
+static void dfile_close(DFile *d)
+{
+    if (d->f != NULL) fclose(d->f);
+    memset(d, 0, sizeof *d);
+}
+static size_t dfile_read(DFile *d, uint8_t *buf, size_t n)
+{
+    if (d->f != NULL) return fread(buf, 1, n, d->f);
+    if (d->pos >= d->len) return 0;
+    if (n > d->len - d->pos) n = d->len - d->pos;
+    memcpy(buf, d->mem + d->pos, n);
+    d->pos += n;
+    return n;
+}
+/* -1 on error, else the new position */
+static long dfile_seek(DFile *d, long off, int whence)
+{
+    long base;
+    if (d->f != NULL) return fseek(d->f, off, whence) != 0 ? -1 : ftell(d->f);
+    base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (long)d->pos : (long)d->len;
+    if (base + off < 0) return -1;
+    d->pos = (size_t)(base + off);
+    return (long)d->pos;
+}
 static int g_trace;
 
 static void set_cf(Cpu *c, int on)
@@ -34,7 +66,7 @@ void dos_init(void)
 {
     int i;
     for (i = 0; i < MAX_FILES; i++) {
-        if (g_files[i] != NULL) fclose(g_files[i]);
+        if (g_files[i] != NULL) dfile_close(g_files[i]);
         g_files[i] = NULL;
     }
     g_trace = getenv("P2_DOSLOG") != NULL;
@@ -135,9 +167,15 @@ static void int21(Cpu *c)
         read_asciiz(c->s[DS], c->r[DX], name, sizeof name);
         for (h = 0; h < MAX_FILES && g_files[h] != NULL; h++) {}
         if (h == MAX_FILES) { c->r[AX] = 4; set_cf(c, 1); return; }
-        g_files[h] = open_game_file(name);
-        if (g_trace) fprintf(stderr, "open %s -> %s\n", name, g_files[h] ? "ok" : "missing");
-        if (g_files[h] == NULL) { c->r[AX] = 2; set_cf(c, 1); return; }
+        {
+            DFile *d = &g_slots[h];
+            memset(d, 0, sizeof *d);
+            d->mem = hal_pack_find(name, &d->len);
+            if (d->mem == NULL) d->f = open_game_file(name);
+            if (g_trace) fprintf(stderr, "open %s -> %s\n", name, d->mem ? "pack" : d->f ? "ok" : "missing");
+            if (d->mem == NULL && d->f == NULL) { c->r[AX] = 2; set_cf(c, 1); return; }
+            g_files[h] = d;
+        }
         c->r[AX] = (uint16_t)(h + 5);
         set_cf(c, 0);
         return;
@@ -145,7 +183,7 @@ static void int21(Cpu *c)
     case 0x3E: {
         int h = c->r[BX] - 5;
         if (h >= 0 && h < MAX_FILES && g_files[h] != NULL) {
-            fclose(g_files[h]);
+            dfile_close(g_files[h]);
             g_files[h] = NULL;
             set_cf(c, 0);
         } else { c->r[AX] = 6; set_cf(c, 1); }
@@ -156,7 +194,7 @@ static void int21(Cpu *c)
         uint8_t buf[65536];
         size_t n, i;
         if (h < 0 || h >= MAX_FILES || g_files[h] == NULL) { c->r[AX] = 6; set_cf(c, 1); return; }
-        n = fread(buf, 1, c->r[CX], g_files[h]);
+        n = dfile_read(g_files[h], buf, c->r[CX]);
         for (i = 0; i < n; i++) wb(lin(c->s[DS], c->r[DX]) + (uint32_t)i, buf[i]);
         c->r[AX] = (uint16_t)n;
         set_cf(c, 0);
@@ -178,8 +216,8 @@ static void int21(Cpu *c)
         int whence = (c->r[AX] & 0xFFu) == 0 ? SEEK_SET : (c->r[AX] & 0xFFu) == 1 ? SEEK_CUR : SEEK_END;
         if (h < 0 || h >= MAX_FILES || g_files[h] == NULL) { c->r[AX] = 6; set_cf(c, 1); return; }
         if ((c->r[AX] & 0xFFu) != 0) off = (long)(int32_t)off;
-        if (fseek(g_files[h], off, whence) != 0) { c->r[AX] = 25; set_cf(c, 1); return; }
-        pos = ftell(g_files[h]);
+        pos = dfile_seek(g_files[h], off, whence);
+        if (pos < 0) { c->r[AX] = 25; set_cf(c, 1); return; }
         c->r[AX] = (uint16_t)pos;
         c->r[DX] = (uint16_t)((uint32_t)pos >> 16);
         set_cf(c, 0);

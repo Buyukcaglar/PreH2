@@ -70,4 +70,9 @@ void dos_trap(Cpu *c, uint8_t n);
 
 int sqz_unpack(const uint8_t *in, size_t inlen, uint8_t **out, size_t *outlen, int cdrun);
 
+/* pack.c: game files held in memory (tools/mkpak.py); searched before the game folder */
+int hal_set_pack(const uint8_t *pak, size_t len);   /* 1 when the pack is valid; it must stay alive */
+int hal_have_pack(void);
+const uint8_t *hal_pack_find(const char *name, size_t *len);
+
 #endif

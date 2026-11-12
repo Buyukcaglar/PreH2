@@ -330,6 +330,12 @@ static uint8_t *read_file(const char *name, size_t *len)
     FILE *f;
     uint8_t *b;
     long n;
+    const uint8_t *m = hal_pack_find(name, len);
+    if (m != NULL) {
+        b = (uint8_t *)malloc(*len > 0 ? *len : 1u);
+        if (b != NULL) memcpy(b, m, *len);
+        return b;
+    }
     (void)snprintf(path, sizeof path, "%s/%s", host_game_dir(), name);
     f = fopen(path, "rb");
     if (f == NULL) return NULL;

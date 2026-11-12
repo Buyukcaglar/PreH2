@@ -6,6 +6,8 @@ native 64-bit program. The Windows x64 build is done. The macOS build comes late
 The original game files are **not** included. You need your own copy of the DOS game: the
 folder that holds `PRE2.SQZ` and its data files (in the CD version, the `PREH2` folder).
 
+![The main menu in the PreH2 window (Windows 11, dark theme)](docs/screenshot-menu.png)
+
 ## Playing
 
 1. Unpack the release zip anywhere.
@@ -64,6 +66,7 @@ Needs Visual Studio 2022 or later (C/C++ desktop workload). From any prompt:
 ```
 build.cmd           rem build\PreH2.exe and build\p2test.exe
 build.cmd game      rem only the game
+build.cmd private   rem build\private\PreH2.exe with your game files inside (personal use only)
 package.cmd         rem dist\PreH2-1.0-win64.zip
 ```
 

@@ -138,6 +138,18 @@ static int pick_game_dir(HWND owner, wchar_t *out)
     return ok;
 }
 
+/* a private build (build.cmd private) carries the game files as RCDATA 100 (tools/mkpak.py) */
+static int load_embedded_pack(void)
+{
+    HRSRC r = FindResourceW(NULL, MAKEINTRESOURCEW(100), MAKEINTRESOURCEW(10) /* RT_RCDATA */);
+    HGLOBAL g;
+    const void *p;
+    if (r == NULL || (g = LoadResource(NULL, r)) == NULL || (p = LockResource(g)) == NULL) return 0;
+    if (!hal_set_pack((const uint8_t *)p, (size_t)SizeofResource(NULL, r))) return 0;
+    (void)strcpy(g_game_dir, ".");
+    return 1;
+}
+
 static int find_game_dir(const wchar_t *cmdline_dir)
 {
     wchar_t found[MAX_PATH * 2], buf[MAX_PATH * 2], *slash;
@@ -594,7 +606,7 @@ static void add_menu(void)
     (void)AppendMenuW(m, MF_STRING, SC_P2_PAUSE, L"&Pause when inactive");
     (void)AppendMenuW(m, MF_SEPARATOR, 0u, NULL);
     (void)AppendMenuW(m, MF_STRING, SC_P2_RESTART, L"&Restart game");
-    (void)AppendMenuW(m, MF_STRING, SC_P2_LOCATE, L"&Locate game files…");
+    if (!hal_have_pack()) (void)AppendMenuW(m, MF_STRING, SC_P2_LOCATE, L"&Locate game files…");
     (void)AppendMenuW(m, MF_SEPARATOR, 0u, NULL);
     (void)AppendMenuW(m, MF_STRING, SC_P2_ABOUT, L"&About…");
     (void)AppendMenuW(m, MF_SEPARATOR, 0u, NULL);
@@ -856,7 +868,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_opt_smooth = ini_int(L"Smooth", 0);
     g_opt_mute = ini_int(L"Mute", 0);
     g_opt_pause_inactive = ini_int(L"PauseInactive", 1);
-    if (!find_game_dir(argc > 1 ? argv[1] : NULL)) return 1;
+    if (!load_embedded_pack() && !find_game_dir(argc > 1 ? argv[1] : NULL)) return 1;
     theme_apply(0);
     memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc;
