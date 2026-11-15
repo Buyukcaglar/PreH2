@@ -1,5 +1,7 @@
 /* machine.c - PIC, PIT, keyboard controller, the port map, the scheduler and the loader. */
 #include "hal.h"
+#include "state.h"
+#include "../qol/qol.h"
 #include "../gen/gen.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,10 +31,14 @@ void pic_lower(int irq)
 {
     pic_irr &= (uint8_t)~(1u << irq);
 }
+int g_hal_sandbox;      /* qol/wide.c runs the game's drawing code aside: no interrupts, no devices but the VGA */
+
 int pic_ack(void)
 {
     int i;
-    uint8_t req = (uint8_t)(pic_irr & ~pic_imr);
+    uint8_t req;
+    if (g_hal_sandbox) return -1;
+    req = (uint8_t)(pic_irr & ~pic_imr);
     for (i = 0; i < 8; i++) {
         if (pic_isr & (1u << i)) return -1;        /* a higher or equal priority is in service */
         if (req & (1u << i)) {
@@ -155,10 +161,12 @@ static int kq_head, kq_tail;
 static uint8_t kbd_data;
 static int kbd_full;            /* a byte waits in port 60h */
 static uint64_t kbd_next = UINT64_MAX;
+static uint8_t key_held[256];   /* the keys the machine has seen go down and not up (scancode | ext << 7) */
 
 void hal_key(uint8_t sc, int down, int ext)
 {
     int n = (kq_tail + (ext ? 2 : 1)) % 64;
+    key_held[(sc & 0x7Fu) | (ext ? 0x80u : 0u)] = (uint8_t)(down != 0);
     if ((kq_tail + 1) % 64 == kq_head || n == kq_head) return;
     if (ext) { kq[kq_tail] = 0xE0u; kq_tail = (kq_tail + 1) % 64; }
     kq[kq_tail] = (uint8_t)(down ? sc : (sc | 0x80u));
@@ -186,6 +194,7 @@ static int g_port_log;
 uint8_t io_in8(uint16_t port)
 {
     if (port >= 0x3B0 && port <= 0x3DF) return vga_in(port);
+    if (g_hal_sandbox) return 0xFFu;
     if (port >= 0x210 && port <= 0x26F) return sb_in(port);
     if (port < 0x20 || (port >= 0x80 && port <= 0x8F)) return dma_in(port);
     switch (port) {
@@ -210,6 +219,7 @@ uint8_t io_in8(uint16_t port)
 void io_out8(uint16_t port, uint8_t v)
 {
     if (port >= 0x3B0 && port <= 0x3DF) { vga_out(port, v); return; }
+    if (g_hal_sandbox) return;
     if (port >= 0x210 && port <= 0x26F) { sb_out(port, v); return; }
     if (port < 0x20 || (port >= 0x80 && port <= 0x8F)) { dma_out(port, v); return; }
     switch (port) {
@@ -237,10 +247,14 @@ static uint64_t frame_no, frame_begin, retrace_on, retrace_off;
 static int latched_this_frame;
 static uint64_t real_base, virt_base;
 static int g_exited;
+static int g_turbo, g_rebase;      /* fast forward; the clocks are set together again at the next frame */
+static uint32_t g_prog_hash;
 static uint64_t g_run_until;
 char g_hal_exit_msg[256];
 
 int hal_exited(void) { return g_exited; }
+void hal_set_turbo(int on) { g_rebase |= g_turbo != on; g_turbo = on; }
+uint32_t hal_program_hash(void) { return g_prog_hash; }
 void hal_program_exit(void) { g_exited = 1; g_cpu.stop = 1; }
 
 static uint64_t frame_tick(uint64_t n)
@@ -251,6 +265,7 @@ static uint64_t frame_tick(uint64_t n)
 /* a polling loop on 3DAh skips ahead to the next event */
 void hal_idle(void)
 {
+    if (g_hal_sandbox) return;
     if (g_run_until > g_cpu.icount) g_cpu.icount = g_run_until;
 }
 
@@ -308,11 +323,19 @@ int hal_frame(void)
         }
     }
     frame_no++;
-    vga_render(&f);
-    host_present(&f);
-    {
-        uint64_t virt_us = (end - virt_base) * 1000000u / PIT_HZ;
-        uint64_t real = host_time_us() - real_base;
+    if (g_rebase) {
+        real_base = host_time_us();
+        virt_base = end;
+        g_rebase = 0;
+    }
+    if (!g_turbo || (frame_no & 3u) == 0) {         /* fast forward: four times the speed, every fourth picture */
+        uint64_t virt_us, real;
+        vga_render(&f);
+        qol_wide_frame(&f);
+        host_present(&f);
+        virt_us = (end - virt_base) * 1000000u / PIT_HZ;
+        if (g_turbo) virt_us /= 4u;
+        real = host_time_us() - real_base;
         if (real < virt_us) host_sleep_us(virt_us - real);
         else if (real > virt_us + 100000u) {
             real_base = host_time_us();
@@ -405,6 +428,11 @@ int hal_init(char *err, int errlen)
     if (hdr + size > xn) { free(exe); (void)snprintf(err, (size_t)errlen, "PRE2.EXE is truncated."); return 0; }
     bios_init();
     memcpy(g_mem + LOAD_SEG * 16u, exe + hdr, size);
+    {
+        size_t k;
+        g_prog_hash = 2166136261u;
+        for (k = 0; k < size; k++) g_prog_hash = (g_prog_hash ^ exe[hdr + k]) * 16777619u;
+    }
     for (i = 0; i < crlc; i++) {
         uint16_t off = (uint16_t)(exe[lfarlc + i * 4] | exe[lfarlc + i * 4 + 1] << 8);
         uint16_t seg = (uint16_t)(exe[lfarlc + i * 4 + 2] | exe[lfarlc + i * 4 + 3] << 8);
@@ -438,13 +466,45 @@ int hal_init(char *err, int errlen)
     real_base = host_time_us();
     virt_base = 0;
     frame_no = 0;
+    g_exited = 0;
+    g_hal_exit_msg[0] = 0;
+    kq_head = kq_tail = 0;
+    kbd_full = 0;
+    kbd_next = UINT64_MAX;
+    memset(key_held, 0, sizeof key_held);
     g_port_log = getenv("P2_PORTLOG") != NULL;
     gen_install(getenv("P2_INTERP") == NULL);   /* P2_INTERP: the interpreter alone (tests) */
+    qol_init();
     return 1;
+}
+
+/* ---- state ---- */
+void machine_state(StateIO *s)
+{
+    ST(s, pic_irr); ST(s, pic_isr); ST(s, pic_imr); ST(s, pic_icw_step); ST(s, pic_read_isr);
+    ST(s, pit); ST(s, pit0_next); ST(s, port61);
+    ST(s, kq); ST(s, kq_head); ST(s, kq_tail); ST(s, kbd_data); ST(s, kbd_full); ST(s, kbd_next);
+    ST(s, key_held);
+    ST(s, frame_no); ST(s, frame_begin); ST(s, retrace_on); ST(s, retrace_off); ST(s, latched_this_frame);
+    ST(s, g_exited);
+    ST(s, g_hal_exit_msg);
+}
+
+/* after a state was loaded: real time starts over, and the keys that were held when the state was
+ * saved are released (the host presses again what is held now) */
+void hal_state_loaded(void)
+{
+    int k;
+    real_base = host_time_us();
+    virt_base = frame_tick(frame_no);
+    g_cpu.stop = 0;
+    for (k = 0; k < 256; k++)
+        if (key_held[k]) hal_key((uint8_t)(k & 0x7F), 0, (k & 0x80) != 0);
 }
 
 void hal_trap(Cpu *c, uint8_t n)
 {
+    if (g_hal_sandbox) { qol_sandbox_trap(c, n); return; }
     switch (n) {
     case 0x08: {                    /* the BIOS timer: ticks at 0040:006C, then EOI */
         uint32_t t = (uint32_t)(g_mem[0x46C] | g_mem[0x46D] << 8 | g_mem[0x46E] << 16 | (uint32_t)g_mem[0x46F] << 24);

@@ -4,7 +4,9 @@
  * (640x480x16) and 13h (320x200x256); the picture is built from the registers, not from the mode
  * number, so the program's own register changes take effect. */
 #include "hal.h"
+#include "state.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static uint8_t planes[4][65536];
@@ -21,6 +23,7 @@ int g_vga_retrace, g_vga_hblank;
 static int poll_count;
 
 static uint32_t fb[640 * 480];
+unsigned g_vga_mode_serial;      /* counts the mode sets: pictures kept from before one are stale */
 
 /* ---- modes ---- */
 typedef struct ModeRegs {
@@ -93,6 +96,7 @@ void vga_set_mode(int mode)
         for (i = 16; i < 32; i++) dac[i][0] = dac[i][1] = dac[i][2] = (uint8_t)((i - 16) * 4 + 3);
     }
     latched_start = 0;
+    g_vga_mode_serial++;
 }
 
 void vga_reset(void)
@@ -271,6 +275,8 @@ void vga_render(HostFrame *f)
         pal[i] = ((r << 2 | r >> 4) << 16) | ((g << 2 | g >> 4) << 8) | (b << 2 | b >> 4);
     }
     f->pixels = fb;
+    f->aspect_w = 4;
+    f->aspect_h = 3;
     if (!(attr[0x10] & 1u) || (seq[1] & 0x20u)) {     /* text mode or screen off: black */
         f->width = 320;
         f->height = 200;
@@ -341,4 +347,71 @@ void vga_debug_dump(const char *path)
     if (f == NULL) return;
     (void)fwrite(planes, 1, sizeof planes, f);
     fclose(f);
+    {
+        int i;
+        fprintf(stderr, "vga: start %04x pan %d misc %02x\n crtc", latched_start, attr[0x13] & 15, misc_out);
+        for (i = 0; i < 25; i++) fprintf(stderr, " %02x", crtc[i]);
+        fprintf(stderr, "\n seq");
+        for (i = 0; i < 5; i++) fprintf(stderr, " %02x", seq[i]);
+        fprintf(stderr, "\n gc");
+        for (i = 0; i < 9; i++) fprintf(stderr, " %02x", gc[i]);
+        fprintf(stderr, "\n attr");
+        for (i = 0; i < 21; i++) fprintf(stderr, " %02x", attr[i]);
+        fprintf(stderr, "\n");
+    }
+}
+
+/* ---- state, and what the widescreen renderer needs to see ---- */
+void vga_state(StateIO *s)
+{
+    st_io(s, planes, sizeof planes);
+    ST(s, latch);
+    ST(s, seq); ST(s, seq_idx);
+    ST(s, gc); ST(s, gc_idx);
+    ST(s, crtc); ST(s, crtc_idx);
+    ST(s, attr); ST(s, attr_idx); ST(s, attr_ff);
+    ST(s, misc_out);
+    ST(s, dac); ST(s, dac_mask);
+    ST(s, dac_widx); ST(s, dac_ridx); ST(s, dac_wsub); ST(s, dac_rsub); ST(s, dac_state);
+    ST(s, latched_start);
+    ST(s, g_vga_retrace); ST(s, g_vga_hblank);
+    ST(s, poll_count);
+    if (!s->write) g_vga_mode_serial++;
+}
+
+uint8_t *vga_plane(int p)
+{
+    return planes[p];
+}
+
+uint16_t vga_display_start(void)
+{
+    return latched_start;
+}
+
+/* the 16-colour modes' picture: 1 when the screen shows 320x200 planar graphics without a split */
+int vga_is_320x200x16(void)
+{
+    int lpr = ((crtc[9] & 0x1F) + 1) * ((crtc[9] & 0x80u) ? 2 : 1);
+    int vde = (crtc[0x12] | ((crtc[7] & 0x02) << 7) | ((crtc[7] & 0x40) << 3)) + 1;
+    int lc = crtc[0x18] | ((crtc[7] & 0x10) << 4) | ((crtc[9] & 0x40) << 3);
+    if (!(attr[0x10] & 1u) || (seq[1] & 0x20u) || (gc[5] & 0x40u)) return 0;
+    return (crtc[1] + 1) * 8 == 320 && vde / lpr == 200 && crtc[0x13] == 0x14 && (attr[0x13] & 7) == 0 &&
+           (lc + 1) / lpr >= 200 && (crtc[0x17] & 3u) == 3u && !(crtc[0x14] & 0x40u) && (crtc[0x17] & 0x40u);
+}
+
+/* the colours of the 16 pixel values, as vga_render shows them now */
+void vga_colors16(uint32_t out[16])
+{
+    int c;
+    for (c = 0; c < 16; c++) {
+        int idx = attr[c & (attr[0x12] & 0x0Fu)], j;
+        uint32_t r, g, b;
+        if (attr[0x10] & 0x80u) idx = (idx & 0x0F) | ((attr[0x14] & 3) << 4);
+        else idx &= 0x3F;
+        idx |= (attr[0x14] & 0x0C) << 4;
+        j = idx & dac_mask;
+        r = dac[j][0]; g = dac[j][1]; b = dac[j][2];
+        out[c] = ((r << 2 | r >> 4) << 16) | ((g << 2 | g >> 4) << 8) | (b << 2 | b >> 4);
+    }
 }

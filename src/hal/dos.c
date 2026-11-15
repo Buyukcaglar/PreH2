@@ -2,6 +2,7 @@
  * Files are read from the embedded pack when there is one (pack.c), otherwise from the game
  * folder (host_game_dir); names are matched without regard to case. */
 #include "hal.h"
+#include "state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@ typedef struct DFile {        /* an open file: on disk (f) or in the pack (mem) 
     FILE *f;
     const uint8_t *mem;
     size_t len, pos;
+    char name[128];
 } DFile;
 static DFile *g_files[MAX_FILES];
 static DFile g_slots[MAX_FILES];
@@ -174,6 +176,7 @@ static void int21(Cpu *c)
             if (d->mem == NULL) d->f = open_game_file(name);
             if (g_trace) fprintf(stderr, "open %s -> %s\n", name, d->mem ? "pack" : d->f ? "ok" : "missing");
             if (d->mem == NULL && d->f == NULL) { c->r[AX] = 2; set_cf(c, 1); return; }
+            (void)snprintf(d->name, sizeof d->name, "%s", name);
             g_files[h] = d;
         }
         c->r[AX] = (uint16_t)(h + 5);
@@ -351,5 +354,38 @@ void dos_trap(Cpu *c, uint8_t n)
     default:
         fprintf(stderr, "int %02xh ax=%04x not handled\n", n, c->r[AX]);
         return;
+    }
+}
+
+/* open files: the name and the position; a loaded state opens them again */
+void dos_state(StateIO *s)
+{
+    int h;
+    for (h = 0; h < MAX_FILES; h++) {
+        uint8_t used = g_files[h] != NULL;
+        char name[128];
+        int64_t pos = 0;
+        memset(name, 0, sizeof name);
+        if (s->write && used) {
+            DFile *d = g_files[h];
+            memcpy(name, d->name, sizeof name);
+            pos = d->f != NULL ? (int64_t)ftell(d->f) : (int64_t)d->pos;
+        }
+        ST(s, used);
+        ST(s, name);
+        ST(s, pos);
+        if (s->write || s->err) continue;
+        if (g_files[h] != NULL) { dfile_close(g_files[h]); g_files[h] = NULL; }
+        if (used) {
+            DFile *d = &g_slots[h];
+            memset(d, 0, sizeof *d);
+            name[sizeof name - 1] = 0;
+            d->mem = hal_pack_find(name, &d->len);
+            if (d->mem == NULL) d->f = open_game_file(name);
+            if (d->mem == NULL && d->f == NULL) continue;
+            memcpy(d->name, name, sizeof d->name);
+            (void)dfile_seek(d, (long)pos, SEEK_SET);
+            g_files[h] = d;
+        }
     }
 }

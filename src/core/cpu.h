@@ -132,5 +132,10 @@ extern int (*g_native_hook)(Cpu *c, uint64_t until);
 extern const uint8_t g_parity[256];
 extern uint8_t *g_cov;
 extern uint16_t g_cov_cs;
+extern void (*g_step_hook)(Cpu *c);
+extern uint8_t g_ip_hook[65536];
+extern uint16_t g_ip_hook_cs;
+extern void (*g_ip_hook_fn)(Cpu *c);
+extern int g_cpu_trap_any;
 
 #endif

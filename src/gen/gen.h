@@ -19,5 +19,6 @@ extern const unsigned g_gen_block_count;
 
 void gen_install(int on);           /* the recompiled code runs in place of the interpreter */
 extern uint64_t g_gen_blocks_run;
+int gen_has_block(uint16_t ip);      /* a recompiled block starts at this offset */
 
 #endif

@@ -1,10 +1,14 @@
 /* headless/main.c - runs the game without a window, for tests.
  *   p2test GAMEDIR FRAMES [OUTDIR] [script]
  * script: comma-separated "frame:key:down" events (key = set-1 scancode, hex), e.g. "300:1c:1,305:1c:0".
- * Writes OUTDIR/fNNNNN.png every 50 frames and at the end; prints a hash of each frame. */
+ * Writes OUTDIR/fNNNNN.png every 50 frames and at the end; prints a hash of each frame.
+ * P2_WIDE=width turns the widescreen picture on; P2_SAVE=file:frame and P2_LOAD=file:frame save and
+ * load a state. */
 #include "../../hal/hal.h"
 #include "../pngw.h"
 #include "../../gen/gen.h"
+#include "../../qol/qol.h"
+#include "../../hal/state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +49,17 @@ void hal_fatal(const char *msg)
     fprintf(stderr, "FATAL: %s (frame %ld, cs:ip %04x:%04x)\n", msg, g_frame, g_cpu.op_cs, g_cpu.op_ip);
     exit(2);
 }
+/* "file:frame" (P2_SAVE, P2_LOAD): the frame number follows the last colon */
+static int state_arg(const char *arg, char name[512], long *frame)
+{
+    const char *c = strrchr(arg, ':');
+    if (c == NULL || c == arg || (size_t)(c - arg) >= 512u) return 0;
+    memcpy(name, arg, (size_t)(c - arg));
+    name[c - arg] = 0;
+    *frame = atol(c + 1);
+    return 1;
+}
+
 static FILE *g_hashes;   /* P2_HASH: one line per frame, FNV-1a of the picture */
 void host_present(const HostFrame *f)
 {
@@ -64,7 +79,7 @@ void host_present(const HostFrame *f)
 int main(int argc, char **argv)
 {
     char err[512];
-    long frames, i;
+    long frames, i, first = 0;
     const char *script = argc > 4 ? argv[4] : "";
     if (argc < 3) { fprintf(stderr, "usage: p2test GAMEDIR FRAMES [OUTDIR] [script]\n"); return 1; }
     g_dir = argv[1];
@@ -75,9 +90,34 @@ int main(int argc, char **argv)
     if (getenv("P2_WAV")) { g_wav = fopen(getenv("P2_WAV"), "wb"); if (g_wav) fseek(g_wav, 44, SEEK_SET); }
     if (getenv("P2_COV")) { g_cov = (uint8_t *)calloc(65536, 1); g_cov_cs = (uint16_t)(LOAD_SEG + 0x20); }
     if (!hal_init(err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
-    for (i = 0; i < frames; i++) {
+    if (getenv("P2_WIDE")) qol_set_wide(atoi(getenv("P2_WIDE")));
+    if (getenv("P2_LOAD")) {              /* P2_LOAD=file:frame - continue from a state saved at that frame */
+        char name[512];
+        long at = 0;
+        if (state_arg(getenv("P2_LOAD"), name, &at)) {
+            FILE *sf = fopen(name, "rb");
+            uint8_t *b = (uint8_t *)malloc(8u << 20);
+            size_t n = sf && b ? fread(b, 1, 8u << 20, sf) : 0;
+            if (sf) fclose(sf);
+            if (!hal_state_load(b, n)) { fprintf(stderr, "state %s not loaded\n", name); return 1; }
+            free(b);
+            first = at;
+        }
+    }
+    for (i = first; i < frames; i++) {
         const char *p = script;
         g_frame = i;
+        if (getenv("P2_SAVE")) {          /* P2_SAVE=file:frame - save a state before that frame */
+            char name[512];
+            long at = 0;
+            if (state_arg(getenv("P2_SAVE"), name, &at) && at == i) {
+                uint8_t *b = NULL;
+                size_t n = 0;
+                FILE *sf;
+                if (hal_state_save(&b, &n) && (sf = fopen(name, "wb")) != NULL) { fwrite(b, 1, n, sf); fclose(sf); }
+                free(b);
+            }
+        }
         while (p && *p) {
             long fr; unsigned sc; int down;
             if (sscanf(p, "%ld:%x:%d", &fr, &sc, &down) == 3 && fr == i) hal_key((uint8_t)(sc & 0x7F), down, (sc & 0x100) != 0);

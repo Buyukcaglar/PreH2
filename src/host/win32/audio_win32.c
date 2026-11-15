@@ -22,6 +22,7 @@ static int16_t g_bufs[NBUF][BUF_FRAMES * 2];
 static int16_t g_ring[RING_FRAMES * 2];
 static int g_rhead, g_rcount;
 static int g_muted;
+static int g_volume = 256;             /* 0..256 */
 static unsigned long g_drop, g_underrun, g_pushes; /* P2_AUDIOLOG statistics */
 static unsigned long g_ulog[64];
 
@@ -69,6 +70,13 @@ void audio_set_muted(int muted)
     g_muted = muted;
 }
 
+void audio_set_volume(int percent)
+{
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    g_volume = percent * 256 / 100;
+}
+
 static int queued_frames(void)
 {
     int i, n = 0;
@@ -87,8 +95,8 @@ static void feed(void)
         if (!(h->dwFlags & WHDR_DONE)) continue;
         for (k = 0; k < BUF_FRAMES; k++) {
             int s = (g_rhead + k) % RING_FRAMES;
-            g_bufs[i][k * 2] = g_muted ? 0 : g_ring[s * 2];
-            g_bufs[i][k * 2 + 1] = g_muted ? 0 : g_ring[s * 2 + 1];
+            g_bufs[i][k * 2] = g_muted ? 0 : (int16_t)((g_ring[s * 2] * g_volume) >> 8);
+            g_bufs[i][k * 2 + 1] = g_muted ? 0 : (int16_t)((g_ring[s * 2 + 1] * g_volume) >> 8);
         }
         g_rhead = (g_rhead + BUF_FRAMES) % RING_FRAMES;
         g_rcount -= BUF_FRAMES;

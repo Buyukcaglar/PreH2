@@ -1,12 +1,14 @@
-/* host_win32.c - Prehistorik 2's Windows x64 host (PreH2.exe, v1.0).
+/* host_win32.c - Prehistorik 2's Windows x64 host (Prehistorik2.exe, v1.1).
  *
  * The window shows the VGA picture scaled to the client area (4:3 aspect by default, optional integer
  * scaling and smoothing), passes the keyboard to the emulated PC as set-1 scancodes and plays the
  * sound through waveOut (audio_win32.c).  The title bar, the system menu and the About box follow
  * the system's light/dark app mode, and change with it at once (the theme code is the one of the
  * Civ64 project, platform/win32/host_win32.c).  The system menu holds the host's commands: Full screen
- * (Alt+Enter), the display options, Locate game files..., About... and Close.
- * Settings live in %APPDATA%\PreH2\PreH2.ini. */
+ * (Alt+Enter), the display options (with the widescreen modes of qol/wide.c), sound, save states, the
+ * key bindings, Locate game files..., About... and Close.  Host keys: F5 saves a state, F7 loads it,
+ * F12 takes a screenshot, Tab held runs the game fast, Pause stops it.
+ * Settings and save states live in %APPDATA%\PreH2 (PreH2.ini, state1.p2s ...). */
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -27,11 +29,13 @@
 #include <string.h>
 #include <wchar.h>
 #include "../../hal/hal.h"
+#include "../../hal/state.h"
+#include "../../qol/qol.h"
 #include "audio_win32.h"
 #include "../crt.h"
 
 #define APP_NAMEW L"Prehistorik 2"
-#define APP_VERSIONW L"1.0"
+#define APP_VERSIONW L"1.1"
 #define ABOUT_URL L"https://github.com/Buyukcaglar/PreH2"
 
 /* ---- state ---- */
@@ -43,7 +47,15 @@ static uint32_t g_frame[640 * 480];
 static int g_fw = 320, g_fh = 200;
 static int g_opt_crt = 0;   /* Display > CRT scanlines (crt.h) */
 static int g_opt_aspect = 1, g_opt_integer = 0, g_opt_smooth = 0, g_opt_full = 0, g_opt_mute = 0, g_opt_pause_inactive = 1;
+static int g_opt_wide = WIDE_OFF;    /* Display > Widescreen: the playfield's width (qol.h) */
+static int g_opt_volume = 100, g_opt_slot = 1;
+static int g_fa_w = 4, g_fa_h = 3;   /* the picture's shape (HostFrame) */
 static int g_inactive;               /* the window is not the foreground window */
+static int g_user_pause;             /* the Pause key */
+static int g_turbo;                  /* Tab is held: fast forward */
+static int g_pending;                /* asked for between frames: 1 save state, 2 load state, 3 screenshot */
+static wchar_t g_note[96];           /* a short message over the picture ... */
+static uint64_t g_note_until;        /* ... until this time (host_time_us) */
 static WINDOWPLACEMENT g_wp = {sizeof(WINDOWPLACEMENT)};
 static int g_menu_open;             /* a modal loop (menu, About) runs: the game waits */
 static uint8_t g_keys_down[512];    /* scancode | ext<<8 held */
@@ -83,6 +95,9 @@ static void save_options(void)
     ini_set_int(L"FullScreen", g_opt_full);
     ini_set_int(L"Mute", g_opt_mute);
     ini_set_int(L"PauseInactive", g_opt_pause_inactive);
+    ini_set_int(L"Wide", g_opt_wide);
+    ini_set_int(L"Volume", g_opt_volume);
+    ini_set_int(L"Slot", g_opt_slot);
 }
 
 /* ---- the game folder ---- */
@@ -446,23 +461,34 @@ static void show_about(void)
 }
 
 /* ---- the picture ---- */
+/* The canvas is what the window is laid out for: 320 units wide, or the widescreen width, and 240
+ * high (200 without the 4:3 correction).  A picture narrower than the canvas (a menu while the
+ * playfield is wide) keeps its own shape in the middle of it. */
+static int wide_on(void)
+{
+    return g_opt_wide > WIDE_OFF && qol_wide_supported();
+}
+static void canvas_units(int *w, int *h)
+{
+    *w = wide_on() ? g_opt_wide : 320;
+    *h = g_opt_aspect ? 240 : 200;
+}
 static void dest_rect(int cw, int ch, RECT *r)
 {
-    double sw = g_fw, sh = g_fh, dw, dh;
-    if (g_opt_aspect && g_fw * 3 != g_fh * 4) {   /* 320x200 and 640x400 shown 4:3 */
-        sh = sw * 3.0 / 4.0;
-    }
+    int uw, uh;
+    double s, dw, dh, fw;
+    canvas_units(&uw, &uh);
     if (g_opt_integer) {
         int k = 1;
-        while ((k + 1) * g_fw <= cw && (int)((k + 1) * sh * g_fh / g_fh) <= ch) k++;
-        dw = k * sw;
-        dh = k * sh;
-        if (dw > cw || dh > ch) { dw = sw; dh = sh; }
+        while ((k + 1) * uw <= cw && (k + 1) * uh <= ch) k++;
+        s = k;
     } else {
-        double s = (double)cw / sw < (double)ch / sh ? (double)cw / sw : (double)ch / sh;
-        dw = sw * s;
-        dh = sh * s;
+        s = (double)cw / uw < (double)ch / uh ? (double)cw / uw : (double)ch / uh;
     }
+    dh = uh * s;
+    fw = g_opt_aspect ? (double)uh * g_fa_w / g_fa_h : (double)uh * g_fw / g_fh;
+    if (fw > uw) fw = uw;
+    dw = fw * s;
     r->left = (LONG)((cw - dw) / 2.0 + 0.5);
     r->top = (LONG)((ch - dh) / 2.0 + 0.5);
     r->right = r->left + (LONG)(dw + 0.5);
@@ -515,14 +541,36 @@ static int crt_surface(HDC dc, int w, int h)
     return 1;
 }
 
+static void paint_picture(HDC dc, RECT d);
+
 static void paint(HDC dc)
 {
     RECT cr, d;
+    (void)GetClientRect(g_hwnd, &cr);
+    dest_rect(cr.right, cr.bottom, &d);
+    paint_picture(dc, d);
+    if (g_note[0] != 0 && host_time_us() < g_note_until) {
+        RECT t;
+        HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HGDIOBJ old = SelectObject(dc, font);
+        SIZE sz;
+        int n = (int)wcslen(g_note);
+        (void)GetTextExtentPoint32W(dc, g_note, n, &sz);
+        t.left = d.left + 8; t.top = d.top + 8; t.right = t.left + sz.cx + 12; t.bottom = t.top + sz.cy + 6;
+        (void)SetBkColor(dc, RGB(0, 0, 0));
+        (void)SetTextColor(dc, RGB(255, 255, 255));
+        (void)ExtTextOutW(dc, t.left + 6, t.top + 3, ETO_OPAQUE, &t, g_note, (UINT)n, NULL);
+        (void)SelectObject(dc, old);
+    }
+}
+
+static void paint_picture(HDC dc, RECT d)
+{
+    RECT cr;
     BITMAPINFO bi;
     HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RECT bar;
     (void)GetClientRect(g_hwnd, &cr);
-    dest_rect(cr.right, cr.bottom, &d);
     bar = cr; bar.bottom = d.top; (void)FillRect(dc, &bar, black);
     bar = cr; bar.top = d.bottom; (void)FillRect(dc, &bar, black);
     bar = cr; bar.top = d.top; bar.bottom = d.bottom; bar.right = d.left; (void)FillRect(dc, &bar, black);
@@ -583,6 +631,8 @@ void host_present(const HostFrame *f)
     HDC dc;
     g_fw = f->width;
     g_fh = f->height;
+    g_fa_w = f->aspect_w > 0 ? f->aspect_w : 4;
+    g_fa_h = f->aspect_h > 0 ? f->aspect_h : 3;
     memcpy(g_frame, f->pixels, (size_t)f->width * (size_t)f->height * 4u);
     if (g_hwnd == NULL || IsIconic(g_hwnd)) return;
     dc = GetDC(g_hwnd);
@@ -660,6 +710,17 @@ static void set_full(int on)
 #define SC_P2_ABOUT 0x1080u
 #define SC_P2_PAUSE 0x1090u
 #define SC_P2_CRT 0x10A0u
+#define SC_P2_SAVE 0x10B0u
+#define SC_P2_LOAD 0x10C0u
+#define SC_P2_KEYS 0x10D0u
+#define SC_P2_SHOT 0x10E0u
+#define SC_P2_WIDE 0x1100u      /* + 0x10 * (0 off, 1 16:10, 2 16:9, 3 21:9) */
+#define SC_P2_SIZE 0x1200u      /* + 0x10 * (0..4): 2x .. 6x */
+#define SC_P2_VOL 0x1300u       /* + 0x10 * (0..3): 100, 75, 50, 25 % */
+#define SC_P2_SLOT 0x1400u      /* + 0x10 * (0..3) */
+
+static const int g_wide_modes[4] = {WIDE_OFF, WIDE_16_10, WIDE_16_9, WIDE_21_9};
+static const int g_volumes[4] = {100, 75, 50, 25};
 
 static void update_menu(void)
 {
@@ -672,12 +733,35 @@ static void update_menu(void)
     (void)CheckMenuItem(m, SC_P2_CRT, MF_BYCOMMAND | (g_opt_crt ? MF_CHECKED : MF_UNCHECKED));
     (void)CheckMenuItem(m, SC_P2_MUTE, MF_BYCOMMAND | (g_opt_mute ? MF_CHECKED : MF_UNCHECKED));
     (void)CheckMenuItem(m, SC_P2_PAUSE, MF_BYCOMMAND | (g_opt_pause_inactive ? MF_CHECKED : MF_UNCHECKED));
+    {
+        int i, uw, uh;
+        RECT wa;
+        UINT dpi = GetDpiForWindow(g_hwnd);
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        (void)GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        wa = mi.rcWork;
+        canvas_units(&uw, &uh);
+        for (i = 0; i < 4; i++) {
+            (void)CheckMenuItem(m, SC_P2_WIDE + 0x10u * (UINT)i, MF_BYCOMMAND | ((wide_on() ? g_opt_wide : WIDE_OFF) == g_wide_modes[i] ? MF_CHECKED : MF_UNCHECKED));
+            if (i > 0) (void)EnableMenuItem(m, SC_P2_WIDE + 0x10u * (UINT)i, MF_BYCOMMAND | (qol_wide_supported() ? MF_ENABLED : MF_GRAYED));
+            (void)CheckMenuItem(m, SC_P2_VOL + 0x10u * (UINT)i, MF_BYCOMMAND | (g_opt_volume == g_volumes[i] ? MF_CHECKED : MF_UNCHECKED));
+            (void)CheckMenuItem(m, SC_P2_SLOT + 0x10u * (UINT)i, MF_BYCOMMAND | (g_opt_slot == i + 1 ? MF_CHECKED : MF_UNCHECKED));
+        }
+        for (i = 0; i < 5; i++) {
+            RECT r = {0, 0, (i + 2) * uw, (i + 2) * uh};
+            (void)AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+            (void)EnableMenuItem(m, SC_P2_SIZE + 0x10u * (UINT)i, MF_BYCOMMAND |
+                                 ((!g_opt_full && r.right - r.left <= wa.right - wa.left && r.bottom - r.top <= wa.bottom - wa.top) ? MF_ENABLED : MF_GRAYED));
+        }
+    }
 }
 
 static void add_menu(void)
 {
-    HMENU m, disp;
-    int n;
+    HMENU m, disp, sub;
+    int n, i;
+    wchar_t t[32];
     (void)GetSystemMenu(g_hwnd, TRUE);
     m = GetSystemMenu(g_hwnd, FALSE);
     if (m == NULL) return;
@@ -692,9 +776,39 @@ static void add_menu(void)
     (void)AppendMenuW(disp, MF_STRING, SC_P2_SMOOTH, L"&Smooth scaling");
     (void)AppendMenuW(disp, MF_SEPARATOR, 0u, NULL);
     (void)AppendMenuW(disp, MF_STRING, SC_P2_CRT, L"&CRT scanlines");
+    (void)AppendMenuW(disp, MF_SEPARATOR, 0u, NULL);
+    sub = CreatePopupMenu();
+    (void)AppendMenuW(sub, MF_STRING, SC_P2_WIDE, L"&Off (original 4:3)");
+    (void)AppendMenuW(sub, MF_STRING, SC_P2_WIDE + 0x10u, L"16:1&0");
+    (void)AppendMenuW(sub, MF_STRING, SC_P2_WIDE + 0x20u, L"16:&9");
+    (void)AppendMenuW(sub, MF_STRING, SC_P2_WIDE + 0x30u, L"&21:9");
+    (void)AppendMenuW(disp, MF_POPUP, (UINT_PTR)sub, L"&Widescreen");
+    sub = CreatePopupMenu();
+    for (i = 0; i < 5; i++) {
+        (void)swprintf(t, 32, L"&%d\u00D7", i + 2);
+        (void)AppendMenuW(sub, MF_STRING, SC_P2_SIZE + 0x10u * (UINT)i, t);
+    }
+    (void)AppendMenuW(disp, MF_POPUP, (UINT_PTR)sub, L"Window si&ze");
     (void)AppendMenuW(m, MF_POPUP, (UINT_PTR)disp, L"&Display");
     (void)AppendMenuW(m, MF_STRING, SC_P2_MUTE, L"&Mute sound");
+    sub = CreatePopupMenu();
+    for (i = 0; i < 4; i++) {
+        (void)swprintf(t, 32, L"%d %%", g_volumes[i]);
+        (void)AppendMenuW(sub, MF_STRING, SC_P2_VOL + 0x10u * (UINT)i, t);
+    }
+    (void)AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"&Volume");
     (void)AppendMenuW(m, MF_STRING, SC_P2_PAUSE, L"&Pause when inactive");
+    (void)AppendMenuW(m, MF_STRING, SC_P2_KEYS, L"&Keys\u2026");
+    (void)AppendMenuW(m, MF_SEPARATOR, 0u, NULL);
+    (void)AppendMenuW(m, MF_STRING, SC_P2_SAVE, L"&Save state\tF5");
+    (void)AppendMenuW(m, MF_STRING, SC_P2_LOAD, L"L&oad state\tF7");
+    sub = CreatePopupMenu();
+    for (i = 0; i < 4; i++) {
+        (void)swprintf(t, 32, L"Slot &%d", i + 1);
+        (void)AppendMenuW(sub, MF_STRING, SC_P2_SLOT + 0x10u * (UINT)i, t);
+    }
+    (void)AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"S&tate slot");
+    (void)AppendMenuW(m, MF_STRING, SC_P2_SHOT, L"Scree&nshot\tF12");
     (void)AppendMenuW(m, MF_SEPARATOR, 0u, NULL);
     (void)AppendMenuW(m, MF_STRING, SC_P2_RESTART, L"&Restart game");
     if (!hal_have_pack()) (void)AppendMenuW(m, MF_STRING, SC_P2_LOCATE, L"&Locate game files…");
@@ -706,7 +820,53 @@ static void add_menu(void)
     update_menu();
 }
 
-/* ---- keyboard ---- */
+/* ---- keyboard ----
+ * Key bindings: every action of the game has the key the original program reads (a set-1 scancode,
+ * +256 when extended) and the key of this keyboard that stands for it (the same by default).  A key
+ * bound to an action sends that action's original key; the original key of an action that was moved
+ * elsewhere sends nothing; every other key goes to the game as it is. */
+typedef struct Action {
+    const wchar_t *name, *ini;
+    int game;
+} Action;
+static const Action g_actions[] = {
+    {L"Left", L"Left", 0x14B}, {L"Right", L"Right", 0x14D}, {L"Up / jump", L"Up", 0x148},
+    {L"Down / crouch", L"Down", 0x150}, {L"Strike", L"Strike", 0x39}, {L"Scroll the view", L"Scroll", 0x4C},
+    {L"Pause (the game's)", L"Pause", 0x19}, {L"Restart at the green light", L"Restart", 0x3B},
+    {L"Back to the menu", L"Menu", 0x3C}, {L"Sound on/off", L"Sound", 0x3D},
+};
+#define N_ACTIONS (sizeof g_actions / sizeof g_actions[0])
+static int g_bind[N_ACTIONS];
+static uint32_t g_pad_prev;         /* the gamepad's buttons at the last poll (pad_poll) */
+
+static void load_binds(void)
+{
+    size_t a;
+    for (a = 0; a < N_ACTIONS; a++) {
+        int k = (int)GetPrivateProfileIntW(L"Keys", g_actions[a].ini, g_actions[a].game, g_ini);
+        g_bind[a] = (k > 0 && k < 512 && (k & 0x80) == 0) ? k : g_actions[a].game;
+    }
+}
+static void save_binds(void)
+{
+    size_t a;
+    for (a = 0; a < N_ACTIONS; a++) {
+        wchar_t b[16];
+        (void)swprintf(b, 16, L"%d", g_bind[a]);
+        (void)WritePrivateProfileStringW(L"Keys", g_actions[a].ini, b, g_ini);
+    }
+}
+/* the game's key for a key of the keyboard, or -1 when it sends nothing */
+static int map_key(int k)
+{
+    size_t a;
+    for (a = 0; a < N_ACTIONS; a++)
+        if (g_bind[a] == k) return g_actions[a].game;
+    for (a = 0; a < N_ACTIONS; a++)
+        if (g_actions[a].game == k) return -1;
+    return k;
+}
+
 static void release_keys(void)
 {
     int i;
@@ -722,11 +882,400 @@ static void key_event(WPARAM vk, LPARAM l, int down)
 {
     int sc = (int)((l >> 16) & 0x7F);
     int ext = (l & (1 << 24)) != 0;
-    if (vk == VK_PAUSE) return;
+    int k;
     if (sc == 0) sc = (int)MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
-    if (sc == 0x45 && !ext) ext = 0;
-    g_keys_down[sc | (ext ? 256 : 0)] = (uint8_t)down;
-    if (g_running) hal_key((uint8_t)sc, down, ext);
+    k = map_key(sc | (ext ? 256 : 0));
+    if (k < 0) return;
+    g_keys_down[k] = (uint8_t)down;
+    if (g_running) hal_key((uint8_t)(k & 0x7F), down, k >= 256);
+}
+
+/* ---- pause, fast forward, messages ---- */
+static void update_title(void)
+{
+    (void)SetWindowTextW(g_hwnd, (g_user_pause || (g_inactive && g_opt_pause_inactive)) ? APP_NAMEW L" (paused)" : APP_NAMEW);
+}
+static void apply_mute(void)
+{
+    audio_set_muted(g_opt_mute || g_turbo || g_user_pause || (g_inactive && g_opt_pause_inactive));
+}
+static void set_turbo(int on)
+{
+    if (g_turbo == on) return;
+    g_turbo = on;
+    hal_set_turbo(on);
+    apply_mute();
+}
+static void note(const wchar_t *text)
+{
+    (void)wcsncpy(g_note, text, 95);
+    g_note[95] = 0;
+    g_note_until = host_time_us() + 1500000u;
+    (void)InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+/* ---- save states: %APPDATA%\PreH2\stateN.p2s ---- */
+static void state_path(wchar_t *out, int slot)
+{
+    wchar_t *sl;
+    (void)wcscpy(out, g_ini);
+    sl = wcsrchr(out, L'\\');
+    (void)swprintf(sl != NULL ? sl + 1 : out, 32, L"state%d.p2s", slot);
+}
+
+static void save_state(void)
+{
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    wchar_t path[MAX_PATH + 32], msg[96];
+    HANDLE f;
+    DWORD wr = 0;
+    int ok = 0;
+    if (!hal_state_save(&buf, &len)) { note(L"The state could not be saved"); return; }
+    state_path(path, g_opt_slot);
+    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        ok = WriteFile(f, buf, (DWORD)len, &wr, NULL) && wr == (DWORD)len;
+        (void)CloseHandle(f);
+        if (!ok) (void)DeleteFileW(path);
+    }
+    free(buf);
+    (void)swprintf(msg, 96, ok ? L"State saved (slot %d)" : L"The state could not be saved (slot %d)", g_opt_slot);
+    note(msg);
+}
+
+static void load_state(void)
+{
+    wchar_t path[MAX_PATH + 32], msg[96];
+    HANDLE f;
+    LARGE_INTEGER size;
+    uint8_t *buf = NULL;
+    DWORD rd = 0;
+    int ok = 0, i;
+    state_path(path, g_opt_slot);
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart < (64 << 20) && (buf = (uint8_t *)malloc((size_t)size.QuadPart)) != NULL &&
+            ReadFile(f, buf, (DWORD)size.QuadPart, &rd, NULL) && rd == (DWORD)size.QuadPart)
+            ok = hal_state_load(buf, (size_t)rd);
+        (void)CloseHandle(f);
+        free(buf);
+        if (ok) {                           /* the keys held now are pressed again in the loaded machine */
+            for (i = 0; i < 512; i++)
+                if (g_keys_down[i]) hal_key((uint8_t)(i & 0x7F), 1, i >= 256);
+            g_pad_prev = 0;
+        }
+        (void)swprintf(msg, 96, ok ? L"State loaded (slot %d)" : L"The state in slot %d is not usable", g_opt_slot);
+    } else {
+        (void)swprintf(msg, 96, L"No state in slot %d", g_opt_slot);
+    }
+    note(msg);
+}
+
+/* ---- screenshot: Pictures\Prehistorik 2\Prehistorik2-<date>-<time>.png, in the picture's shape on
+ * a 4:3 screen (5x6 screen pixels for each pixel of a 200-line mode), encoded by GDI+ ---- */
+static void screenshot(void)
+{
+    typedef struct GpStartup { UINT32 version; void *callback; BOOL no_thread, no_codecs; } GpStartup;
+    typedef int(WINAPI * StartFn)(ULONG_PTR *, const GpStartup *, void *);
+    typedef int(WINAPI * CreateFn)(INT, INT, INT, INT, BYTE *, void **);
+    typedef int(WINAPI * SaveFn)(void *, const WCHAR *, const CLSID *, const void *);
+    typedef int(WINAPI * DisposeFn)(void *);
+    static const CLSID png = {0x557CF406, 0x1A04, 0x11D3, {0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E}};
+    static HMODULE gp;
+    static ULONG_PTR token;
+    static CreateFn create;
+    static SaveFn save;
+    static DisposeFn dispose;
+    wchar_t dir[MAX_PATH], path[MAX_PATH + 80];
+    SYSTEMTIME st;
+    int kx = g_fh == 200 ? 5 : 2, ky = g_fh == 200 ? 6 : 2, w = g_fw * kx, h = g_fh * ky, x, y, ok = 0;
+    uint32_t *px;
+    void *bmp = NULL;
+    if (gp == NULL) {
+        GpStartup in = {1, NULL, FALSE, FALSE};
+        StartFn start;
+        gp = LoadLibraryExW(L"gdiplus.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        start = gp != NULL ? (StartFn)(void *)GetProcAddress(gp, "GdiplusStartup") : NULL;
+        if (start != NULL && start(&token, &in, NULL) == 0) {
+            create = (CreateFn)(void *)GetProcAddress(gp, "GdipCreateBitmapFromScan0");
+            save = (SaveFn)(void *)GetProcAddress(gp, "GdipSaveImageToFile");
+            dispose = (DisposeFn)(void *)GetProcAddress(gp, "GdipDisposeImage");
+        }
+    }
+    if (create == NULL || save == NULL || dispose == NULL || SHGetFolderPathW(NULL, CSIDL_MYPICTURES, NULL, 0, dir) != S_OK ||
+        (px = (uint32_t *)malloc((size_t)w * (size_t)h * 4u)) == NULL) {
+        note(L"The screenshot could not be saved");
+        return;
+    }
+    for (y = 0; y < h; y++) {
+        const uint32_t *src = g_frame + (size_t)(y / ky) * (size_t)g_fw;
+        uint32_t *row = px + (size_t)y * (size_t)w;
+        for (x = 0; x < w; x++) row[x] = src[x / kx];
+    }
+    (void)wcscat(dir, L"\\Prehistorik 2");
+    (void)CreateDirectoryW(dir, NULL);
+    GetLocalTime(&st);
+    (void)swprintf(path, MAX_PATH + 80, L"%ls\\Prehistorik2-%04d%02d%02d-%02d%02d%02d-%03d.png", dir, st.wYear, st.wMonth, st.wDay,
+                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    if (create(w, h, w * 4, 0x00022009 /* 32 bits, RGB */, (BYTE *)px, &bmp) == 0 && bmp != NULL) {
+        ok = save(bmp, path, &png, NULL) == 0;
+        (void)dispose(bmp);
+    }
+    free(px);
+    note(ok ? L"Screenshot saved in Pictures\\Prehistorik 2" : L"The screenshot could not be saved");
+}
+
+/* ---- window size and place ---- */
+static void set_client_size(int cw, int ch)
+{
+    RECT r = {0, 0, cw, ch}, wr;
+    MONITORINFO mi;
+    (void)AdjustWindowRectExForDpi(&r, (DWORD)GetWindowLongW(g_hwnd, GWL_STYLE), FALSE, 0, GetDpiForWindow(g_hwnd));
+    (void)SetWindowPos(g_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    mi.cbSize = sizeof mi;                 /* keep it on the screen */
+    if (GetWindowRect(g_hwnd, &wr) && GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+        int dx = 0, dy = 0;
+        if (wr.right > mi.rcWork.right) dx = mi.rcWork.right - wr.right;
+        if (wr.left + dx < mi.rcWork.left) dx = mi.rcWork.left - wr.left;
+        if (wr.bottom > mi.rcWork.bottom) dy = mi.rcWork.bottom - wr.bottom;
+        if (wr.top + dy < mi.rcWork.top) dy = mi.rcWork.top - wr.top;
+        if (dx != 0 || dy != 0) (void)SetWindowPos(g_hwnd, NULL, wr.left + dx, wr.top + dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+static void set_window_scale(int k)
+{
+    int uw, uh;
+    if (g_opt_full) return;
+    if (IsZoomed(g_hwnd)) (void)ShowWindow(g_hwnd, SW_RESTORE);
+    canvas_units(&uw, &uh);
+    set_client_size(k * uw, k * uh);
+}
+
+/* Display > Widescreen: the window keeps its height and takes the new shape */
+static void set_wide(int width)
+{
+    int uw0, uw, uh;
+    canvas_units(&uw0, &uh);
+    g_opt_wide = width;
+    save_options();
+    qol_set_wide(wide_on() ? g_opt_wide : WIDE_OFF);
+    canvas_units(&uw, &uh);
+    if (uw != uw0 && !g_opt_full && !IsZoomed(g_hwnd) && !IsIconic(g_hwnd)) {
+        RECT cr;
+        (void)GetClientRect(g_hwnd, &cr);
+        set_client_size(MulDiv(cr.bottom, uw, uh), cr.bottom);
+    }
+    (void)InvalidateRect(g_hwnd, NULL, FALSE);
+    update_menu();
+}
+
+static void save_placement(void)
+{
+    RECT r;
+    if (g_opt_full || IsZoomed(g_hwnd) || IsIconic(g_hwnd) || !GetWindowRect(g_hwnd, &r)) return;
+    ini_set_int(L"WinX", r.left);
+    ini_set_int(L"WinY", r.top);
+    ini_set_int(L"WinW", r.right - r.left);
+    ini_set_int(L"WinH", r.bottom - r.top);
+}
+static void restore_placement(void)
+{
+    RECT r;
+    int w = ini_int(L"WinW", 0), h = ini_int(L"WinH", 0);
+    if (w < 200 || h < 150) return;
+    r.left = ini_int(L"WinX", 0);
+    r.top = ini_int(L"WinY", 0);
+    r.right = r.left + w;
+    r.bottom = r.top + h;
+    if (MonitorFromRect(&r, MONITOR_DEFAULTTONULL) == NULL) return;
+    (void)SetWindowPos(g_hwnd, NULL, r.left, r.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/* ---- the Keys box ---- */
+#define IDC_KEYS_LIST 301
+#define IDC_KEYS_CHANGE 302
+#define IDC_KEYS_RESET 303
+#define IDC_KEYS_HINT 304
+static const wchar_t g_keys_hint[] = L"Choose an action, press Change (or double-click it), then press its new key.";
+
+static void key_name(int k, wchar_t *out, int n)
+{
+    LONG l = (LONG)(((k & 0x7F) << 16) | ((k & 0x100) ? (1 << 24) : 0));
+    if (GetKeyNameTextW(l, out, n) == 0) (void)swprintf(out, (size_t)n, L"key %02X%ls", k & 0x7F, (k & 0x100) ? L" (extended)" : L"");
+}
+
+static void keys_fill(HWND dlg)
+{
+    HWND lb = GetDlgItem(dlg, IDC_KEYS_LIST);
+    int sel = (int)SendMessageW(lb, LB_GETCURSEL, 0u, 0);
+    size_t a;
+    (void)SendMessageW(lb, LB_RESETCONTENT, 0u, 0);
+    for (a = 0; a < N_ACTIONS; a++) {
+        wchar_t line[160], kn[64];
+        key_name(g_bind[a], kn, 64);
+        (void)swprintf(line, 160, L"%ls\t%ls", g_actions[a].name, kn);
+        (void)SendMessageW(lb, LB_ADDSTRING, 0u, (LPARAM)line);
+    }
+    (void)SendMessageW(lb, LB_SETCURSEL, (WPARAM)(sel < 0 ? 0 : sel), 0);
+}
+
+static void keys_theme(HWND dlg)
+{
+    HWND lb = GetDlgItem(dlg, IDC_KEYS_LIST);
+    g_about_dark = theme_wanted();
+    theme_window(dlg, g_about_dark);
+    if (lb != NULL) {
+        if (g_ux_window != NULL) (void)g_ux_window(lb, g_about_dark ? TRUE : FALSE);
+        (void)SetWindowTheme(lb, g_about_dark ? L"DarkMode_Explorer" : NULL, NULL);
+        (void)SendMessageW(lb, WM_THEMECHANGED, 0u, 0);
+    }
+    (void)RedrawWindow(dlg, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+}
+
+/* a row of the list (owner-drawn, so that the chosen row reads well in both themes): the action
+ * on the left, its key from the middle on */
+static void keys_row(const DRAWITEMSTRUCT *di)
+{
+    wchar_t kn[64];
+    RECT r = di->rcItem;
+    int sel = (di->itemState & ODS_SELECTED) != 0;
+    COLORREF bg = g_about_dark ? (sel ? RGB(0, 95, 184) : THEME_DARK_FIELD) : GetSysColor(sel ? COLOR_HIGHLIGHT : COLOR_WINDOW);
+    COLORREF fg = g_about_dark ? THEME_DARK_TEXT : GetSysColor(sel ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT);
+    HBRUSH b = CreateSolidBrush(bg);
+    (void)FillRect(di->hDC, &r, b);
+    (void)DeleteObject(b);
+    if (di->itemID >= N_ACTIONS) return;
+    (void)SetBkMode(di->hDC, TRANSPARENT);
+    (void)SetTextColor(di->hDC, fg);
+    r.left += 6;
+    (void)DrawTextW(di->hDC, g_actions[di->itemID].name, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    r.left = di->rcItem.left + (di->rcItem.right - di->rcItem.left) * 55 / 100;
+    key_name(g_bind[di->itemID], kn, 64);
+    (void)DrawTextW(di->hDC, kn, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+}
+
+/* waits for a key: its index (scancode, +256 extended), or -1 when cancelled or not allowed */
+static int keys_capture(HWND dlg)
+{
+    MSG m;
+    int k = -1;
+    (void)SetDlgItemTextW(dlg, IDC_KEYS_HINT, L"Press the new key (Esc: keep the present one)…");
+    (void)SetFocus(dlg);
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) {
+            int sc = (int)((m.lParam >> 16) & 0x7F), ext = (m.lParam & (1 << 24)) != 0;
+            WPARAM vk = m.wParam;
+            if (vk != VK_ESCAPE && vk != VK_F5 && vk != VK_F7 && vk != VK_F11 && vk != VK_F12 && vk != VK_TAB && vk != VK_PAUSE &&
+                vk != VK_RETURN && vk != VK_LWIN && vk != VK_RWIN && sc != 0)
+                k = sc | (ext ? 256 : 0);
+            break;
+        }
+        if (m.message == WM_LBUTTONDOWN || m.message == WM_RBUTTONDOWN || m.message == WM_NCLBUTTONDOWN) {
+            (void)PostMessageW(m.hwnd, m.message, m.wParam, m.lParam);   /* the click does what it would have done */
+            break;
+        }
+        (void)DispatchMessageW(&m);
+        if (!IsWindow(dlg)) return -1;
+    }
+    (void)SetDlgItemTextW(dlg, IDC_KEYS_HINT, g_keys_hint);
+    (void)SetFocus(GetDlgItem(dlg, IDC_KEYS_LIST));
+    return k;
+}
+
+static INT_PTR CALLBACK keys_proc(HWND dlg, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_INITDIALOG: {
+        RECT du = {0, 0, 4, 11};               /* a row: 11 dialog units high */
+        (void)MapDialogRect(dlg, &du);
+        (void)SendDlgItemMessageW(dlg, IDC_KEYS_LIST, LB_SETITEMHEIGHT, 0u, (LPARAM)du.bottom);
+        g_about_bg = CreateSolidBrush(THEME_DARK_BG);
+        g_about_field = CreateSolidBrush(THEME_DARK_FIELD);
+        keys_fill(dlg);
+        keys_theme(dlg);
+        (void)SetFocus(GetDlgItem(dlg, IDC_KEYS_LIST));
+        return FALSE;
+    }
+    case WM_DESTROY:
+        if (g_about_bg != NULL) { (void)DeleteObject(g_about_bg); g_about_bg = NULL; }
+        if (g_about_field != NULL) { (void)DeleteObject(g_about_field); g_about_field = NULL; }
+        break;
+    case WM_SETTINGCHANGE:
+        if (theme_setting(l)) keys_theme(dlg);
+        break;
+    case WM_DRAWITEM:
+        if (w == IDOK || w == IDC_KEYS_CHANGE || w == IDC_KEYS_RESET) { box_button((const DRAWITEMSTRUCT *)l, g_about_dark, g_about_bg); return TRUE; }
+        if (w == IDC_KEYS_LIST) { keys_row((const DRAWITEMSTRUCT *)l); return TRUE; }
+        break;
+    case WM_CTLCOLORDLG:
+        if (g_about_dark && g_about_bg != NULL) return (INT_PTR)g_about_bg;
+        break;
+    case WM_CTLCOLORSTATIC:
+        if (g_about_dark && g_about_bg != NULL) {
+            (void)SetTextColor((HDC)w, THEME_DARK_TEXT);
+            (void)SetBkColor((HDC)w, THEME_DARK_BG);
+            return (INT_PTR)g_about_bg;
+        }
+        break;
+    case WM_CTLCOLORLISTBOX:
+        if (g_about_dark && g_about_field != NULL) {
+            (void)SetTextColor((HDC)w, THEME_DARK_TEXT);
+            (void)SetBkColor((HDC)w, THEME_DARK_FIELD);
+            return (INT_PTR)g_about_field;
+        }
+        break;
+    case WM_COMMAND:
+        if (LOWORD(w) == IDC_KEYS_CHANGE || (LOWORD(w) == IDC_KEYS_LIST && HIWORD(w) == LBN_DBLCLK)) {
+            int a = (int)SendDlgItemMessageW(dlg, IDC_KEYS_LIST, LB_GETCURSEL, 0u, 0), k;
+            size_t o;
+            if (a < 0 || a >= (int)N_ACTIONS) return TRUE;
+            k = keys_capture(dlg);
+            if (k < 0 || !IsWindow(dlg)) return TRUE;
+            for (o = 0; o < N_ACTIONS; o++)
+                if (g_bind[o] == k) g_bind[o] = g_bind[a];        /* the key's former action takes this one's key */
+            g_bind[a] = k;
+            keys_fill(dlg);
+            return TRUE;
+        }
+        if (LOWORD(w) == IDC_KEYS_RESET) {
+            size_t a;
+            for (a = 0; a < N_ACTIONS; a++) g_bind[a] = g_actions[a].game;
+            keys_fill(dlg);
+            return TRUE;
+        }
+        if (LOWORD(w) == IDOK || LOWORD(w) == IDCANCEL) { save_binds(); EndDialog(dlg, 1); return TRUE; }
+        break;
+    default:
+        break;
+    }
+    return FALSE;
+}
+
+static void show_keys(void)
+{
+    Tmpl t;
+    DWORD style = DS_MODALFRAME | DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    memset(&t, 0, sizeof t);
+    t_word(&t, LOWORD(style)); t_word(&t, HIWORD(style));
+    t_word(&t, 0); t_word(&t, 0);
+    t_word(&t, 5);
+    t_word(&t, 0); t_word(&t, 0); t_word(&t, 240); t_word(&t, 176);
+    t_word(&t, 0); t_word(&t, 0);
+    t_str(&t, APP_NAMEW L" - keys");
+    t_word(&t, 9);
+    t_str(&t, L"Segoe UI");
+    t_item(&t, WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 8, 220, 18, IDC_KEYS_HINT, 0x0082, g_keys_hint);
+    t_item(&t, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
+           10, 30, 220, 116, IDC_KEYS_LIST, 0x0083, L"");
+    t_item(&t, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 10, 154, 60, 15, IDC_KEYS_CHANGE, 0x0080, L"&Change…");
+    t_item(&t, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 76, 154, 60, 15, IDC_KEYS_RESET, 0x0080, L"&Defaults");
+    t_item(&t, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 180, 154, 50, 15, IDOK, 0x0080, L"OK");
+    release_keys();
+    g_menu_open++;
+    (void)DialogBoxIndirectParamW(GetModuleHandleW(NULL), (LPCDLGTEMPLATEW)t.buf, g_hwnd, keys_proc, 0);
+    g_menu_open--;
 }
 
 static int start_game(void)
@@ -740,6 +1289,7 @@ static int start_game(void)
         MessageBoxW(g_hwnd, w, APP_NAMEW, MB_OK | MB_ICONERROR);
         return 0;
     }
+    qol_set_wide(wide_on() ? g_opt_wide : WIDE_OFF);
     g_running = 1;
     return 1;
 }
@@ -777,8 +1327,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
     case WM_ACTIVATEAPP:
         if (!w) release_keys();
         g_inactive = !w;
-        (void)SetWindowTextW(h, (g_inactive && g_opt_pause_inactive) ? APP_NAMEW L" (paused)" : APP_NAMEW);
-        audio_set_muted(g_opt_mute || (g_inactive && g_opt_pause_inactive));
+        update_title();
+        apply_mute();
         break;
     case WM_SETCURSOR:
         if (LOWORD(l) == HTCLIENT && g_opt_full) {
@@ -788,6 +1338,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
         break;
     case WM_KILLFOCUS:
         release_keys();
+        set_turbo(0);
         break;
     case WM_ENTERMENULOOP: case WM_ENTERSIZEMOVE:
         g_menu_open++;
@@ -806,7 +1357,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
         case SC_P2_INTEGER: g_opt_integer = !g_opt_integer; save_options(); update_menu(); (void)InvalidateRect(h, NULL, FALSE); return 0;
         case SC_P2_SMOOTH: g_opt_smooth = !g_opt_smooth; save_options(); update_menu(); (void)InvalidateRect(h, NULL, FALSE); return 0;
         case SC_P2_CRT: g_opt_crt = !g_opt_crt; save_options(); update_menu(); (void)InvalidateRect(h, NULL, FALSE); return 0;
-        case SC_P2_MUTE: g_opt_mute = !g_opt_mute; audio_set_muted(g_opt_mute || (g_inactive && g_opt_pause_inactive)); save_options(); update_menu(); return 0;
+        case SC_P2_MUTE: g_opt_mute = !g_opt_mute; apply_mute(); save_options(); update_menu(); return 0;
+        case SC_P2_SAVE: g_pending = 1; return 0;
+        case SC_P2_LOAD: g_pending = 2; return 0;
+        case SC_P2_SHOT: g_pending = 3; return 0;
+        case SC_P2_KEYS: show_keys(); return 0;
         case SC_P2_ABOUT: show_about(); return 0;
         case SC_P2_PAUSE: g_opt_pause_inactive = !g_opt_pause_inactive; save_options(); update_menu(); return 0;
         case SC_P2_RESTART:
@@ -827,8 +1382,19 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
         case SC_KEYMENU:
             if (l == 0 || l == VK_RETURN) return 0;   /* Alt alone, F10: the game's */
             break;
-        default:
+        default: {
+            UINT id = (UINT)(w & 0xFFF0u);
+            if (id >= SC_P2_WIDE && id <= SC_P2_WIDE + 0x30u) { set_wide(g_wide_modes[(id - SC_P2_WIDE) >> 4]); return 0; }
+            if (id >= SC_P2_SIZE && id <= SC_P2_SIZE + 0x40u) { set_window_scale((int)((id - SC_P2_SIZE) >> 4) + 2); return 0; }
+            if (id >= SC_P2_VOL && id <= SC_P2_VOL + 0x30u) {
+                g_opt_volume = g_volumes[(id - SC_P2_VOL) >> 4];
+                audio_set_volume(g_opt_volume);
+                save_options();
+                return 0;
+            }
+            if (id >= SC_P2_SLOT && id <= SC_P2_SLOT + 0x30u) { g_opt_slot = (int)((id - SC_P2_SLOT) >> 4) + 1; save_options(); return 0; }
             break;
+        }
         }
         break;
     case WM_SYSKEYDOWN:
@@ -848,13 +1414,24 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM w, LPARAM l)
             if (!(l & (1 << 30))) { set_full(!g_opt_full); update_menu(); }
             return 0;
         }
+        if (w == VK_F5 || w == VK_F7 || w == VK_F12) {
+            if (!(l & (1 << 30))) g_pending = w == VK_F5 ? 1 : w == VK_F7 ? 2 : 3;
+            return 0;
+        }
+        if (w == VK_TAB) { set_turbo(1); return 0; }
+        if (w == VK_PAUSE) {
+            if (!(l & (1 << 30))) { g_user_pause = !g_user_pause; update_title(); apply_mute(); }
+            return 0;
+        }
         key_event(w, l, 1);
         return 0;
     case WM_KEYUP:
-        if (w == VK_F11) return 0;
+        if (w == VK_F11 || w == VK_F5 || w == VK_F7 || w == VK_F12 || w == VK_PAUSE) return 0;
+        if (w == VK_TAB) { set_turbo(0); return 0; }
         key_event(w, l, 0);
         return 0;
     case WM_CLOSE:
+        save_placement();
         g_quit = 1;
         return 0;
     case WM_DESTROY:
@@ -961,6 +1538,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_opt_crt = ini_int(L"Crt", 0);
     g_opt_mute = ini_int(L"Mute", 0);
     g_opt_pause_inactive = ini_int(L"PauseInactive", 1);
+    g_opt_wide = ini_int(L"Wide", WIDE_OFF);
+    if (g_opt_wide != WIDE_16_10 && g_opt_wide != WIDE_16_9 && g_opt_wide != WIDE_21_9) g_opt_wide = WIDE_OFF;
+    g_opt_volume = ini_int(L"Volume", 100);
+    g_opt_slot = ini_int(L"Slot", 1);
+    if (g_opt_slot < 1 || g_opt_slot > 4) g_opt_slot = 1;
+    load_binds();
     if (!load_embedded_pack() && !find_game_dir(argc > 1 ? argv[1] : NULL)) return 1;
     theme_apply(0);
     memset(&wc, 0, sizeof wc);
@@ -974,7 +1557,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     (void)RegisterClassExW(&wc);
     dpi = GetDpiForSystem();
     r.left = 0; r.top = 0;
-    r.right = MulDiv(960, (int)dpi, 96);
+    r.right = MulDiv(g_opt_wide > WIDE_OFF ? 3 * g_opt_wide : 960, (int)dpi, 96);
     r.bottom = MulDiv(720, (int)dpi, 96);
     {
         RECT wa;
@@ -987,14 +1570,27 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     if (g_hwnd == NULL) return 1;
     theme_apply(0);
     add_menu();
+    restore_placement();
     (void)ShowWindow(g_hwnd, show);
     (void)UpdateWindow(g_hwnd);
     if (ini_int(L"FullScreen", 0)) { set_full(1); update_menu(); }
     (void)audio_open();
     audio_set_muted(g_opt_mute);
+    audio_set_volume(g_opt_volume);
     if (!start_game()) return 1;
     while (!g_quit) {
-        if (!g_running || g_menu_open || IsIconic(g_hwnd) || (g_inactive && g_opt_pause_inactive)) {
+        if (g_note[0] != 0 && host_time_us() >= g_note_until) {
+            g_note[0] = 0;
+            (void)InvalidateRect(g_hwnd, NULL, FALSE);
+        }
+        if (g_pending && g_running && !g_menu_open) {
+            int what = g_pending;
+            g_pending = 0;
+            if (what == 1) save_state();
+            else if (what == 2) load_state();
+            else screenshot();
+        }
+        if (!g_running || g_menu_open || IsIconic(g_hwnd) || g_user_pause || (g_inactive && g_opt_pause_inactive)) {
             host_pump();
             host_sleep_us(15000);
             continue;

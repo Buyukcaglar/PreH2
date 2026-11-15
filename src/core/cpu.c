@@ -7,6 +7,7 @@
  * a divide error leaves IP at the instruction. */
 #include "cpu.h"
 #include "../hal/hal.h"
+#include "../hal/state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -439,6 +440,20 @@ static void aaa_aas(Cpu *c, int sub)
 
 uint8_t *g_cov;           /* coverage: one byte per offset of segment g_cov_cs (tests) */
 uint16_t g_cov_cs;
+void (*g_step_hook)(Cpu *c);   /* diagnostics: called before every interpreted instruction */
+
+/* address hooks: g_ip_hook_fn runs before the instruction at g_ip_hook_cs:ip when g_ip_hook[ip] is set
+ * (the recompiled code's dispatcher makes the same check before a block, gen_rt.c) */
+uint8_t g_ip_hook[65536];
+uint16_t g_ip_hook_cs;
+void (*g_ip_hook_fn)(Cpu *c);
+int g_cpu_trap_any;            /* the trap opcode is accepted in any segment (qol/wide.c's calls) */
+
+void cpu_state(StateIO *s)
+{
+    ST(s, g_cpu);
+    st_io(s, g_mem, sizeof g_mem);
+}
 
 /* one instruction */
 static void step(Cpu *c)
@@ -448,9 +463,11 @@ static void step(Cpu *c)
     d.c = c;
     d.seg = -1;
     d.rep = 0;
+    if (g_ip_hook_fn != NULL && g_ip_hook[c->ip] && c->s[CS] == g_ip_hook_cs) g_ip_hook_fn(c);
     c->op_cs = c->s[CS];
     c->op_ip = c->ip;
     if (g_cov != NULL && c->s[CS] == g_cov_cs) g_cov[c->ip] = 1;
+    if (g_step_hook != NULL) g_step_hook(c);
 prefix:
     op = fetch8(c);
     switch (op) {
@@ -733,7 +750,7 @@ prefix:
     case 0xEE: io_out8(c->r[DX], (uint8_t)c->r[AX]); return;
     case 0xEF: io_out8(c->r[DX], (uint8_t)c->r[AX]); io_out8((uint16_t)(c->r[DX] + 1), (uint8_t)(c->r[AX] >> 8)); return;
     case 0xF1:
-        if (c->s[CS] == TRAP_SEG) { hal_trap(c, fetch8(c)); return; }
+        if (c->s[CS] == TRAP_SEG || g_cpu_trap_any) { hal_trap(c, fetch8(c)); return; }
         invalid(c);
         return;
     case 0xF4: c->halted = 1; return;

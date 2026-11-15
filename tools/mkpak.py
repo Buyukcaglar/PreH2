@@ -1,6 +1,6 @@
 """mkpak.py GAMEDIR OUT.pak - packs the game's files into one file for src/hal/pack.c.
 
-Used by `build.cmd private` for a personal build that carries the game inside PreH2.exe.
+Used by `build.cmd private` for a personal build that carries the game inside Prehistorik2.exe.
 Such a build contains the game's data: it must not be published or shared."""
 import os
 import struct

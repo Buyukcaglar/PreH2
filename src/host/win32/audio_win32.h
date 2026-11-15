@@ -5,4 +5,5 @@ int audio_open(void);
 void audio_close(void);
 void audio_push(const int16_t *stereo, int frames);
 void audio_set_muted(int muted);
+void audio_set_volume(int percent);   /* 0..100 */
 #endif

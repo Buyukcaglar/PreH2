@@ -21,6 +21,7 @@
 typedef struct HostFrame {
     int width, height;                /* logical size of the picture (320x200, 640x480, 640x400 text) */
     const uint32_t *pixels;           /* width*height 0x00RRGGBB */
+    int aspect_w, aspect_h;           /* the picture's shape on the screen: 4:3, or wider (qol/wide.c) */
 } HostFrame;
 
 void host_present(const HostFrame *f);          /* a new picture (once per video frame) */
@@ -38,6 +39,10 @@ void hal_key(uint8_t scancode, int down, int extended);   /* PC set-1 scancodes 
 void hal_fatal(const char *msg);
 extern char g_hal_exit_msg[256];                /* the DOS program's last message (int 21h/09h) */
 int hal_exited(void);
+void hal_set_turbo(int on);                     /* fast forward: four times the speed, every 4th picture */
+uint32_t hal_program_hash(void);                /* identifies the loaded PRE2.EXE (save states) */
+void hal_state_loaded(void);
+extern int g_hal_sandbox;
 
 /* ---- internal ---- */
 void vga_reset(void);
@@ -46,6 +51,11 @@ void vga_out(uint16_t port, uint8_t v);
 void vga_set_mode(int mode);
 void vga_render(HostFrame *f);
 void vga_debug_dump(const char *path);   /* the four planes, raw */
+uint8_t *vga_plane(int p);               /* 64 KB */
+uint16_t vga_display_start(void);
+int vga_is_320x200x16(void);
+void vga_colors16(uint32_t out[16]);
+extern unsigned g_vga_mode_serial;
 void vga_vsync_latch(void);
 extern int g_vga_retrace;             /* 1 during vertical retrace */
 extern int g_vga_hblank;

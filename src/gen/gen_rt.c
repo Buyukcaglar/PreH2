@@ -13,6 +13,10 @@ static int gen_hook(Cpu *c, uint64_t until)
     int ran = 0;
     if (c->s[CS] != GAME_CS || (f = g_table[c->ip]) == NULL) return 0;
     for (;;) {
+        if (g_ip_hook[c->ip] && g_ip_hook_fn != NULL) {
+            g_ip_hook_fn(c);                       /* it leaves the machine as it found it */
+            if (c->stop) break;
+        }
         if (!f(c)) break;
         ran = 1;
         g_gen_blocks_run++;
@@ -20,6 +24,11 @@ static int gen_hook(Cpu *c, uint64_t until)
         if ((f = g_table[c->ip]) == NULL) break;
     }
     return ran;
+}
+
+int gen_has_block(uint16_t ip)
+{
+    return g_table[ip] != NULL;
 }
 
 void gen_install(int on)

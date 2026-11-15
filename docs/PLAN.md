@@ -2,7 +2,7 @@
 
 Goal: rebuild the DOS game *Prehistorik 2* (Titus, 1993) as a native program, first for
 Windows x64, later for macOS (built on a separate Mac). Version **v1.0** of the
-reconstruction. Private repository **Prehistorik2**, public repository **PreH2**.
+reconstruction; **v1.1** adds the QoL features (section 7). The Windows program is `Prehistorik2.exe`. Private repository **Prehistorik2**, public repository **PreH2**.
 The original game files are never committed. The player supplies them, and the program reads
 them at run time.
 
@@ -47,7 +47,7 @@ stages. Every stage ends with a program that runs.
 - **The window follows the OS theme**: dark or light title bar (DWM immersive dark mode),
   menus through uxtheme, and a live switch on `WM_SETTINGCHANGE "ImmersiveColorSet"`.
   The code is the same as Civ64's (`Civ1RE/claude/port/platform/win32/host_win32.c`).
-- **System menu**: Full screen, Display ▸, Mute sound, Pause when inactive, Restart game,
+- **System menu** (v1.0): Full screen, Display ▸, Mute sound, Pause when inactive, Restart game,
   Locate game files…, About…, Close. The About box matches
   Civ64's: icon, title "Prehistorik 2 v1.0", repository link, and the MIT licence of the port's
   own code with a note that the game's program and data belong to their owners. It follows
@@ -65,7 +65,7 @@ stages. Every stage ends with a program that runs.
 | M2 | Recompiler + HAL, headless | title sequence renders to PNG frames in a test | ✔ `p2test`; recompiled = interpreted on 9,000 frames |
 | M3 | Win64 host v1.0 | the game is playable; theme and About done | ✔ 2026-11-13 |
 | M4 | Lifting | renderer, input, sound and level code in readable C | next |
-| M5 | QoL | widescreen, configurable keys, … | next |
+| M5 | QoL | widescreen, configurable keys, … | ✔ 2026-11-16 (v1.1, section 7) |
 | M6 | macOS port | on the Mac machine | next |
 
 ## 5. Rules
@@ -84,4 +84,33 @@ stages. Every stage ends with a program that runs.
   probe and the one self-modified site (26FAh) run in the interpreter.
 - Time is virtual (24 M instructions/s, 70.086 Hz frames). The host syncs to real time once a
   frame. Polling the VGA status port fast-forwards to the next event.
-- Remaining for later milestones: lifting (M4), widescreen and QoL (M5), macOS (M6).
+- Remaining for later milestones: lifting (M4), macOS (M6).
+
+## 7. QoL (v1.1, Windows)
+
+Section 2 planned to put widescreen into lifted code. It was done without lifting instead, beside
+the unchanged program, so the game's behaviour stays that of the original.
+
+- **Widescreen** (`src/qol/wide.c`): 384, 428 or 560 pixels in place of 320. The game keeps a
+  tile buffer exactly 20 tiles wide, so the extra columns cannot be read from video memory. At a
+  fixed point of every frame (background composed, sprites not yet drawn; also in the death,
+  passage, level-start and curtain loops) the module copies the machine (CPU, 640 KB, VGA),
+  shifts the camera by whole tiles, mirrors and rotates the backdrop picture, and calls the
+  game's own routines (tiles, backdrop tiles, compose, sparks, sprites, foreground tiles, insects,
+  weather) in a sandbox: no interrupts, no ports other than the VGA's, a trap as the return
+  address. It keeps the new columns for the page that was drawn and restores the machine. The
+  frame is put together when the page is shown. The status bar stays in the middle; its ends are
+  continued with its plain edge columns. The program's bytes at the hook points are checked at
+  load, so another game version turns the feature off instead of misbehaving.
+- **Save states** (`src/hal/state.c`): each module has one `*_state()` routine for both
+  directions (CPU and memory, VGA, Sound Blaster, PIC/PIT/keyboard, open DOS files, the widescreen
+  margins). The file carries a hash of the program image. A damaged file leaves the running game
+  as it was. F5/F7, four slots.
+- **Host**: fast forward (Tab, 4×), Pause key, screenshots (F12), volume, window sizes 2×–6×,
+  window placement kept, key bindings (`[Keys]` in the INI, the Keys… box).
+- **Checks**: with and without widescreen the game executes the same instructions on every
+  frame (8,000 frames); a run continued from a state gives the same pictures and instruction
+  counts as the original run (1,000 frames, at each width); recompiled and interpreted runs give
+  the same widescreen pictures (3,200 frames).
+- Not done: cheats; widescreen for the full-screen pictures (menu, map), which are 320 wide by
+  nature; key bindings for the gamepad.

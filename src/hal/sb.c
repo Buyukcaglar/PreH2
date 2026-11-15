@@ -3,6 +3,7 @@
  * The DSP plays the bytes of the DMA block at the time constant's rate in virtual time; the block's
  * end raises IRQ 7 (single-cycle: once; auto-init: every block). */
 #include "hal.h"
+#include "state.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +43,7 @@ static uint64_t out_tick_num;      /* the next output sample's time: out_n * PIT
 static uint64_t out_n;
 static int16_t outbuf[2048 * 2];
 static int outcount;
+static float hp_x, hp_y, lp;      /* the output filter */
 
 void speaker_set(int on, uint16_t divisor)
 {
@@ -277,7 +279,6 @@ void sb_advance(uint64_t now)
             s += ph ? 3000 : -3000;
         }
         {   /* the card's output: AC coupling (about 20 Hz) and its low-pass (about 6 kHz) */
-            static float hp_x, hp_y, lp;
             float x = (float)s, y = x - hp_x + 0.99715f * hp_y;
             hp_x = x;
             hp_y = y;
@@ -293,4 +294,19 @@ void sb_advance(uint64_t now)
     }
     if (outcount >= 256) flush_audio();
     (void)dma_phys;
+}
+
+void sb_state(StateIO *s)
+{
+    ST(s, dma_base_addr); ST(s, dma_base_count); ST(s, dma_addr); ST(s, dma_count);
+    ST(s, dma_page); ST(s, dma_mode); ST(s, dma_masked); ST(s, dma_ff);
+    ST(s, dsp_out); ST(s, dsp_out_n); ST(s, dsp_cmd); ST(s, dsp_args);
+    ST(s, dsp_need); ST(s, dsp_have); ST(s, dsp_reset_state); ST(s, speaker_on_sb);
+    ST(s, sb_rate); ST(s, sb_block); ST(s, sb_irq_pending);
+    ST(s, play_active); ST(s, play_auto); ST(s, play_len); ST(s, play_start); ST(s, play_end);
+    ST(s, direct_level);
+    ST(s, spk_on); ST(s, spk_div);
+    ST(s, out_tick_num); ST(s, out_n);
+    ST(s, hp_x); ST(s, hp_y); ST(s, lp);
+    if (!s->write) outcount = 0;      /* samples not yet handed over belong to the replaced machine */
 }
